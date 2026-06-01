@@ -1,7 +1,7 @@
 module.exports = {
   apps: [
     {
-      name: 'flap-monitor',
+      name: 'flap-vault-monitor',
       script: 'monitor.js',
       cwd: __dirname,
       instances: 1,

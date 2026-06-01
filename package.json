@@ -6,9 +6,9 @@
   "scripts": {
     "start": "node monitor.js",
     "pm2:start": "pm2 start ecosystem.config.js",
-    "pm2:stop": "pm2 stop flap-monitor",
-    "pm2:restart": "pm2 restart flap-monitor",
-    "pm2:logs": "pm2 logs flap-monitor"
+    "pm2:stop": "pm2 stop flap-vault-monitor",
+    "pm2:restart": "pm2 restart flap-vault-monitor",
+    "pm2:logs": "pm2 logs flap-vault-monitor"
   },
   "dependencies": {
     "puppeteer": "^23.0.0",
