@@ -61,6 +61,17 @@ async function sendFeishu(title, content) {
             content: content,
           },
           {
+            tag: 'action',
+            actions: [
+              {
+                tag: 'button',
+                text: { tag: 'plain_text', content: '打开监控页面' },
+                url: FLAP_URL,
+                type: 'primary',
+              },
+            ],
+          },
+          {
             tag: 'note',
             elements: [
               { tag: 'plain_text', content: `Flap Monitor · ${new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}` },
@@ -87,8 +98,6 @@ async function notifyNewStock(stock) {
     `**Token名称：** ${stock.name}`,
     `**合约地址：** ${stock.address}`,
     `**发现时间：** ${new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}`,
-    `---`,
-    `[查看页面](${FLAP_URL})`,
   ].join('\n');
   await sendFeishu(title, content);
 }
@@ -100,8 +109,6 @@ async function notifyStartup(assets) {
     `**轮询间隔：** ${POLL_INTERVAL / 1000}s`,
     `**当前已知股票（${assets.length}只）：**`,
     list,
-    `---`,
-    `新股票出现时将立即推送通知`,
   ].join('\n');
   await sendFeishu(title, content);
 }
