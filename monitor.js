@@ -156,55 +156,57 @@ async function scrapeAssets() {
     await page.goto(FLAP_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
     await new Promise((r) => setTimeout(r, PAGE_WAIT));
 
-    // Extract asset data from the page
+    // Extract asset data from the page using DOM selectors
+    // Page structure: each asset has CSS classes:
+    //   description <p> class="mt-0.5 truncate text-xs text-white/50" -> "NVIDIA (Ondo Tokenized)"
+    //   address <p> class="font-mono text-xs text-white/45" -> "0xA9eE...6F75"
     const assets = await page.evaluate(() => {
       const results = [];
-      // The page shows assets in a list under "Supported Assets"
-      // Each asset block contains: symbol, name (like "NVDAon"), description, and contract address
-      const allText = document.body.innerText;
 
-      // Strategy 1: Look for the pattern of known token format
-      // Tokens appear as: SYMBOL\nSYMBOLon\nCompanyName (Ondo Tokenized)\n0xAddr
-      const regex = /([A-Z]{2,6})\n([A-Z]{2,6}on)\n(.+?\(Ondo Tokenized\))\n(0x[a-fA-F0-9]{4}\.{3}[a-fA-F0-9]{4})/g;
-      let match;
-      while ((match = regex.exec(allText)) !== null) {
-        results.push({
-          symbol: match[1],
-          name: match[2],
-          description: match[3].trim(),
-          address: match[4],
-        });
-      }
+      // Strategy 1 (primary): DOM-based using known CSS classes
+      const descEls = document.querySelectorAll('p.truncate');
+      descEls.forEach((descEl) => {
+        const descText = descEl.textContent.trim();
+        if (!descText.includes('Ondo Tokenized')) return;
 
-      // Strategy 2: If regex didn't work, try DOM-based extraction
+        // Walk up to find the parent container, then find siblings
+        const container = descEl.closest('div') || descEl.parentElement;
+        if (!container) return;
+
+        // Find the address element (has font-mono class)
+        const addrEl = container.querySelector('p.font-mono') ||
+                       container.parentElement?.querySelector('p.font-mono');
+        const address = addrEl ? addrEl.textContent.trim() : 'unknown';
+
+        // Find symbol: look for text like "NVDAon" near the description
+        const allText = container.parentElement?.innerText || container.innerText;
+        const lines = allText.split('\n').map((l) => l.trim()).filter(Boolean);
+        const descIdx = lines.findIndex((l) => l.includes('Ondo Tokenized'));
+
+        let symbol = '';
+        let name = '';
+        if (descIdx >= 1) {
+          name = lines[descIdx - 1]; // e.g. "NVDAon"
+          symbol = name.replace(/on$/, ''); // e.g. "NVDA"
+        }
+
+        if (symbol && name) {
+          results.push({ symbol, name, description: descText, address });
+        }
+      });
+
+      // Strategy 2 (fallback): Regex on full page text with \n+ separators
       if (results.length === 0) {
-        // Look for elements that contain "on" suffix tokens and "Ondo Tokenized"
-        const elements = document.querySelectorAll('div, span, p, li');
-        const ondoElements = [];
-        elements.forEach((el) => {
-          if (el.textContent.includes('Ondo Tokenized') && el.textContent.includes('0x')) {
-            ondoElements.push(el.textContent.trim());
-          }
-        });
-
-        for (const text of ondoElements) {
-          const lines = text.split('\n').map((l) => l.trim()).filter(Boolean);
-          for (let i = 0; i < lines.length; i++) {
-            if (lines[i].includes('Ondo Tokenized') && i > 0) {
-              const addrLine = lines[i + 1] || '';
-              const addrMatch = addrLine.match(/(0x[a-fA-F0-9].+)/);
-              const symbolLine = lines[i - 1] || '';
-              const symbolMatch = symbolLine.match(/^([A-Z]{2,6}on)$/);
-              if (symbolMatch) {
-                results.push({
-                  symbol: symbolMatch[1].replace(/on$/, ''),
-                  name: symbolMatch[1],
-                  description: lines[i].trim(),
-                  address: addrMatch ? addrMatch[1] : 'unknown',
-                });
-              }
-            }
-          }
+        const allText = document.body.innerText;
+        const regex = /([A-Z]{2,6})\n+([A-Z]{2,6}on)\n+(.+?\(Ondo Tokenized\))\n+(0x[a-fA-F0-9]{4}[.\u2026]{1,3}[a-fA-F0-9]{4})/g;
+        let match;
+        while ((match = regex.exec(allText)) !== null) {
+          results.push({
+            symbol: match[1],
+            name: match[2],
+            description: match[3].trim(),
+            address: match[4],
+          });
         }
       }
 
