@@ -178,8 +178,10 @@ async function scrapeAssets() {
     const assets = await page.evaluate(() => {
       const allText = document.body.innerText;
 
-      // Match the 4-line pattern: SYMBOL \n NAMEon \n Company (Ondo Tokenized) \n 0xAddr
-      const regex = /\b([A-Z]{2,6})\n+(\1on)\n+(.+?\(Ondo Tokenized\))\n+(0x[a-fA-F0-9]{4}[.\u2026]+[a-fA-F0-9]{4})/g;
+      // Match the 4-line pattern: SYMBOL \n SYMBOLon \n Description (Provider) \n 0xAddr
+      // Uses backreference \1 to ensure name = symbol + "on", preventing false matches.
+      // Description pattern is flexible to support any provider (Ondo, BlackRock, etc.)
+      const regex = /\b([A-Z]{2,6})\n+(\1on)\n+(.+?\(.+?Tokenized\))\n+(0x[a-fA-F0-9]{4}[.\u2026]+[a-fA-F0-9]{4})/g;
       const results = [];
       let match;
       while ((match = regex.exec(allText)) !== null) {
