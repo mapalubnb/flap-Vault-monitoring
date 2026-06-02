@@ -326,39 +326,36 @@ async function main() {
   if (!initialAssets || initialAssets.length === 0) {
     console.error('[MAIN] Initial scrape returned no assets. Check the URL and page structure.');
     console.log('[MAIN] Will keep retrying...');
+    // Send startup notification even if initial scrape fails
+    await notifyStartup([]);
   } else {
     const isFirstRun = knownAssets.size === 0;
-    let newCount = 0;
+    const newOnes = [];
 
     for (const asset of initialAssets) {
       if (!knownAssets.has(asset.symbol)) {
+        newOnes.push(asset);
         knownAssets.set(asset.symbol, {
           name: asset.name,
           description: asset.description,
           address: asset.address,
           discoveredAt: new Date().toISOString(),
         });
-        newCount++;
       }
     }
     saveState();
 
     console.log(`[MAIN] Baseline: ${knownAssets.size} assets known`);
 
-    if (isFirstRun) {
-      // First run — just report baseline, don't alert
-      await notifyStartup(initialAssets);
-    } else if (newCount > 0) {
-      // Restarted and found new assets since last run
-      const newOnes = initialAssets.filter((a) => {
-        const known = knownAssets.get(a.symbol);
-        return known && known.discoveredAt === new Date().toISOString();
-      });
+    // Always send startup notification on every restart
+    await notifyStartup(initialAssets);
+
+    // If new assets were found since last run, also send individual alerts
+    if (!isFirstRun && newOnes.length > 0) {
+      console.log(`[MAIN] 🚨 New assets since last run: ${newOnes.map((a) => a.symbol).join(', ')}`);
       for (const stock of newOnes) {
         await notifyNewStock(stock);
       }
-    } else {
-      await notifyStartup(initialAssets);
     }
   }
 
