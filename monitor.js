@@ -15,7 +15,7 @@ const STATE_FILE = path.join(__dirname, 'known_assets.json');
 let browser = null;
 let page = null;
 let knownAssets = new Map(); // symbol -> { name, address }
-let isPolling = false;
+let baselineEstablished = false; // true after first successful scrape has been processed
 let consecutiveErrors = 0;
 const MAX_CONSECUTIVE_ERRORS = 10;
 
@@ -178,10 +178,10 @@ async function scrapeAssets() {
     const assets = await page.evaluate(() => {
       const allText = document.body.innerText;
 
-      // Match the 4-line pattern: SYMBOL \n SYMBOLon \n Description (Provider) \n 0xAddr
-      // Uses backreference \1 to ensure name = symbol + "on", preventing false matches.
-      // Description pattern is flexible to support any provider (Ondo, BlackRock, etc.)
-      const regex = /\b([A-Z]{2,6})\n+(\1on)\n+(.+?\(.+?Tokenized\))\n+(0x[a-fA-F0-9]{4}[.\u2026]+[a-fA-F0-9]{4})/g;
+      // Match the 4-line pattern: SYMBOL \n NAMEon \n Description (Provider) \n 0xAddr
+      // Symbol and name are matched independently — name just needs to end with "on"
+      // because some assets have mismatched symbol/name (e.g. GOOG / GOOGLon).
+      const regex = /\b([A-Z]{2,6})\n+([A-Z][A-Za-z]{1,9}on)\n+(.+?\(.+?Tokenized\))\n+(0x[a-fA-F0-9]{4}[.\u2026]+[a-fA-F0-9]{4})/g;
       const results = [];
       let match;
       while ((match = regex.exec(allText)) !== null) {
@@ -235,6 +235,27 @@ async function poll() {
 
     consecutiveErrors = 0;
     console.log(`[POLL] Found ${assets.length} assets: ${assets.map((a) => a.symbol).join(', ')}`);
+
+    // If baseline was not established during startup (initial scrape failed),
+    // treat the first successful scrape as baseline — not as new assets.
+    if (!baselineEstablished) {
+      console.log('[POLL] Establishing baseline from first successful scrape...');
+      for (const asset of assets) {
+        if (!knownAssets.has(asset.symbol)) {
+          knownAssets.set(asset.symbol, {
+            name: asset.name,
+            description: asset.description,
+            address: asset.address,
+            discoveredAt: new Date().toISOString(),
+          });
+        }
+      }
+      saveState();
+      baselineEstablished = true;
+      // Send startup notification now that we have real data
+      await notifyStartup(assets);
+      return;
+    }
 
     // Check for new assets
     const newAssets = [];
@@ -306,19 +327,25 @@ async function main() {
   // Init browser
   await initBrowser();
 
-  // First scrape to establish baseline
+  // First scrape to establish baseline (retry up to 3 times)
   console.log('[MAIN] Performing initial scrape...');
-  const initialAssets = await scrapeAssets();
+  let initialAssets = null;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    initialAssets = await scrapeAssets();
+    if (initialAssets && initialAssets.length > 0) break;
+    console.warn(`[MAIN] Initial scrape attempt ${attempt}/3 returned no assets, retrying...`);
+    await new Promise((r) => setTimeout(r, PAGE_WAIT));
+  }
 
   if (!initialAssets || initialAssets.length === 0) {
-    console.error('[MAIN] Initial scrape returned no assets. Check the URL and page structure.');
-    console.log('[MAIN] Will keep retrying...');
+    console.error('[MAIN] All initial scrape attempts failed. Will establish baseline on first successful poll.');
     // Send startup notification with previously known assets from state file
     const knownList = [...knownAssets.entries()].map(([symbol, info]) => ({
       symbol,
       name: info.name,
     }));
     await notifyStartup(knownList);
+    // baselineEstablished stays false — poll() will handle it
   } else {
     const isFirstRun = knownAssets.size === 0;
     const newOnes = [];
@@ -335,6 +362,7 @@ async function main() {
       }
     }
     saveState();
+    baselineEstablished = true;
 
     console.log(`[MAIN] Baseline: ${knownAssets.size} assets known`);
 
