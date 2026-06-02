@@ -326,8 +326,12 @@ async function main() {
   if (!initialAssets || initialAssets.length === 0) {
     console.error('[MAIN] Initial scrape returned no assets. Check the URL and page structure.');
     console.log('[MAIN] Will keep retrying...');
-    // Send startup notification even if initial scrape fails
-    await notifyStartup([]);
+    // Send startup notification with previously known assets from state file
+    const knownList = [...knownAssets.entries()].map(([symbol, info]) => ({
+      symbol,
+      name: info.name,
+    }));
+    await notifyStartup(knownList);
   } else {
     const isFirstRun = knownAssets.size === 0;
     const newOnes = [];
