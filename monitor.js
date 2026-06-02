@@ -168,38 +168,57 @@ async function scrapeAssets() {
     await page.goto(FLAP_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
     await new Promise((r) => setTimeout(r, PAGE_WAIT));
 
-    // Extract asset data from the page
-    // Page structure: each asset card contains 4 lines in order:
-    //   NVDA                       <- symbol (all uppercase, 2-6 chars)
-    //   NVDAon                     <- token name (symbol + "on")
-    //   NVIDIA (Ondo Tokenized)    <- description
-    //   0xA9eE...6F75              <- contract address
-    // We use a single regex on the full page text to reliably extract all 4 fields.
+    // Extract asset data using DOM structure (not regex on text).
+    // The page has two sets of elements in matching order:
+    //   1. Symbol badges: div.grid.font-mono (text = "NVDA")
+    //      followed by address: p.font-mono.text-white\/45 (text = "0xA9eE...6F75")
+    //   2. Name rows: p.truncate.text-sm.font-semibold (text = "NVDAon")
+    //      followed by description: p.mt-0\.5.truncate (text = "NVIDIA (Ondo Tokenized)")
+    // We query both sets and zip them together by index.
     const assets = await page.evaluate(() => {
-      const allText = document.body.innerText;
+      // Get symbol badges — div elements that are grid + font-mono + 40px square
+      const symbolEls = document.querySelectorAll('div.grid.font-mono');
+      // Get address elements
+      const addrEls = document.querySelectorAll('p.font-mono');
+      // Get name elements — p with truncate + text-sm + font-semibold
+      const nameEls = document.querySelectorAll('p.truncate.text-sm.font-semibold');
+      // Get description elements — p with mt-0.5 + truncate
+      const descEls = document.querySelectorAll('p.mt-0\\.5.truncate');
 
-      // Match the 4-line pattern: SYMBOL \n NAMEon \n Description (Provider) \n 0xAddr
-      // Symbol and name are matched independently — name just needs to end with "on"
-      // because some assets have mismatched symbol/name (e.g. GOOG / GOOGLon).
-      const regex = /\b([A-Z]{2,6})\n+([A-Z][A-Za-z]{1,9}on)\n+(.+?\(.+?Tokenized\))\n+(0x[a-fA-F0-9]{4}[.\u2026]+[a-fA-F0-9]{4})/g;
+      // Filter symbol badges: must contain only short uppercase text (the symbol)
+      const symbols = [];
+      const addresses = [];
+      symbolEls.forEach((el) => {
+        const text = el.textContent.trim();
+        if (/^[A-Z0-9]{1,10}$/.test(text)) {
+          symbols.push(text);
+        }
+      });
+
+      // Filter address elements: must start with 0x
+      addrEls.forEach((el) => {
+        const text = el.textContent.trim();
+        if (text.startsWith('0x')) {
+          addresses.push(text);
+        }
+      });
+
+      const names = [...nameEls].map((el) => el.textContent.trim());
+      const descs = [...descEls].map((el) => el.textContent.trim());
+
+      // Zip: the three arrays should have the same length
+      const count = Math.min(symbols.length, names.length, addresses.length);
       const results = [];
-      let match;
-      while ((match = regex.exec(allText)) !== null) {
+      for (let i = 0; i < count; i++) {
         results.push({
-          symbol: match[1],
-          name: match[2],
-          description: match[3].trim(),
-          address: match[4],
+          symbol: symbols[i],
+          name: names[i],
+          description: descs[i] || '',
+          address: addresses[i],
         });
       }
 
-      // Deduplicate by symbol
-      const seen = new Set();
-      return results.filter((r) => {
-        if (seen.has(r.symbol)) return false;
-        seen.add(r.symbol);
-        return true;
-      });
+      return results;
     });
 
     return assets;
