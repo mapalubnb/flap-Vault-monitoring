@@ -11,6 +11,85 @@ const POLL_INTERVAL = parseInt(process.env.POLL_INTERVAL, 10) || 5000;
 const PAGE_WAIT = parseInt(process.env.PAGE_WAIT, 10) || 8000;
 const STATE_FILE = path.join(__dirname, 'known_assets.json');
 
+// --- Chinese name mapping ---
+// Built-in cache for common US stocks (translation APIs can't reliably translate proper nouns)
+const CHINESE_NAMES = {
+  'NVDA': '英伟达', 'NVIDIA': '英伟达',
+  'AAPL': '苹果', 'Apple': '苹果',
+  'TSLA': '特斯拉', 'Tesla': '特斯拉',
+  'MSFT': '微软', 'Microsoft': '微软',
+  'GOOG': '谷歌', 'GOOGL': '谷歌', 'Alphabet': '谷歌',
+  'AMZN': '亚马逊', 'Amazon': '亚马逊',
+  'META': 'Meta(脸书)', 'Meta': 'Meta(脸书)',
+  'NFLX': '奈飞', 'Netflix': '奈飞',
+  'AMD': 'AMD超威半导体', 'INTC': '英特尔', 'Intel': '英特尔',
+  'BABA': '阿里巴巴', 'PDD': '拼多多', 'JD': '京东',
+  'COIN': 'Coinbase', 'PLTR': 'Palantir',
+  'CRM': '赛富时', 'ORCL': '甲骨文', 'Oracle': '甲骨文',
+  'DIS': '迪士尼', 'Disney': '迪士尼',
+  'BA': '波音', 'Boeing': '波音',
+  'JPM': '摩根大通', 'V': 'Visa维萨', 'MA': '万事达',
+  'WMT': '沃尔玛', 'KO': '可口可乐', 'PEP': '百事可乐',
+  'NKE': '耐克', 'SBUX': '星巴克',
+  'SPY': '标普500ETF', 'QQQ': '纳指100ETF',
+  'BRK': '伯克希尔', 'Berkshire': '伯克希尔',
+  'UNH': '联合健康', 'XOM': '埃克森美孚', 'CVX': '雪佛龙',
+  'AVGO': '博通', 'QCOM': '高通', 'Qualcomm': '高通',
+  'ADBE': 'Adobe', 'PYPL': 'PayPal贝宝',
+  'IBM': 'IBM', 'CSCO': '思科', 'Cisco': '思科',
+  'TSM': '台积电', 'SONY': '索尼', 'TM': '丰田',
+};
+
+// Try to get Chinese name: first check cache by symbol, then by company name from description
+function getChineseName(symbol, description) {
+  // Direct symbol match
+  if (CHINESE_NAMES[symbol]) return CHINESE_NAMES[symbol];
+
+  // Extract company name from description (e.g. "NVIDIA (Ondo Tokenized)" -> "NVIDIA")
+  const companyMatch = description?.match(/^(.+?)\s*\(/);
+  if (companyMatch) {
+    const company = companyMatch[1].trim();
+    if (CHINESE_NAMES[company]) return CHINESE_NAMES[company];
+    // Try first word (e.g. "Alphabet Class A" -> "Alphabet")
+    const firstWord = company.split(/\s+/)[0];
+    if (CHINESE_NAMES[firstWord]) return CHINESE_NAMES[firstWord];
+  }
+
+  return null; // No match found
+}
+
+// Translate via free Google Translate API (fallback for unknown stocks)
+async function translateToChineseAPI(text) {
+  try {
+    const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=en&tl=zh-CN&dt=t&q=${encodeURIComponent(text)}`;
+    const res = await axios.get(url, { timeout: 5000 });
+    if (res.data && res.data[0] && res.data[0][0]) {
+      return res.data[0][0][0];
+    }
+  } catch (err) {
+    console.warn('[TRANSLATE] API error:', err.message);
+  }
+  return null;
+}
+
+// Get Chinese name with fallback: cache -> API -> original
+async function getChineseNameWithFallback(symbol, description) {
+  const cached = getChineseName(symbol, description);
+  if (cached) return cached;
+
+  // Extract company name for translation
+  const companyMatch = description?.match(/^(.+?)\s*\(/);
+  const companyName = companyMatch ? companyMatch[1].trim() : symbol;
+  const translated = await translateToChineseAPI(companyName);
+  if (translated && translated !== companyName) {
+    // Cache the result for future use
+    CHINESE_NAMES[symbol] = translated;
+    return translated;
+  }
+
+  return companyName; // Return English name as last resort
+}
+
 // --- Placeholder stubs, filled in sections below ---
 let browser = null;
 let page = null;
@@ -94,8 +173,10 @@ async function sendFeishu(title, content, template = 'red') {
 
 async function notifyNewStock(stock) {
   const title = '🚨 新增可分红股票！';
+  const cnName = await getChineseNameWithFallback(stock.symbol, stock.description);
   const content = [
     `**股票符号：** ${stock.symbol}`,
+    `**中文名称：** ${cnName}`,
     `**Token名称：** ${stock.name}`,
     `**合约地址：** ${stock.address}`,
     `**发现时间：** ${new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}`,
@@ -105,7 +186,12 @@ async function notifyNewStock(stock) {
 
 async function notifyStartup(assets) {
   const title = '✅ Flap 监控已启动';
-  const list = assets.map((a) => `• ${a.symbol} — ${a.name}`).join('\n');
+  const lines = [];
+  for (const a of assets) {
+    const cnName = await getChineseNameWithFallback(a.symbol, a.description);
+    lines.push(`• ${a.symbol}（${cnName}）— ${a.name}`);
+  }
+  const list = lines.join('\n');
   const content = [
     `**轮询间隔：** ${POLL_INTERVAL / 1000}s`,
     `**当前已知股票（${assets.length}只）：**`,
