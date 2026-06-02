@@ -168,58 +168,27 @@ async function scrapeAssets() {
     await page.goto(FLAP_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
     await new Promise((r) => setTimeout(r, PAGE_WAIT));
 
-    // Extract asset data from the page using DOM selectors
-    // Page structure: each asset has CSS classes:
-    //   description <p> class="mt-0.5 truncate text-xs text-white/50" -> "NVIDIA (Ondo Tokenized)"
-    //   address <p> class="font-mono text-xs text-white/45" -> "0xA9eE...6F75"
+    // Extract asset data from the page
+    // Page structure: each asset card contains 4 lines in order:
+    //   NVDA                       <- symbol (all uppercase, 2-6 chars)
+    //   NVDAon                     <- token name (symbol + "on")
+    //   NVIDIA (Ondo Tokenized)    <- description
+    //   0xA9eE...6F75              <- contract address
+    // We use a single regex on the full page text to reliably extract all 4 fields.
     const assets = await page.evaluate(() => {
+      const allText = document.body.innerText;
+
+      // Match the 4-line pattern: SYMBOL \n NAMEon \n Company (Ondo Tokenized) \n 0xAddr
+      const regex = /\b([A-Z]{2,6})\n+(\1on)\n+(.+?\(Ondo Tokenized\))\n+(0x[a-fA-F0-9]{4}[.\u2026]+[a-fA-F0-9]{4})/g;
       const results = [];
-
-      // Strategy 1 (primary): DOM-based using known CSS classes
-      const descEls = document.querySelectorAll('p.truncate');
-      descEls.forEach((descEl) => {
-        const descText = descEl.textContent.trim();
-        if (!descText.includes('Ondo Tokenized')) return;
-
-        // Walk up to find the parent container, then find siblings
-        const container = descEl.closest('div') || descEl.parentElement;
-        if (!container) return;
-
-        // Find the address element (has font-mono class)
-        const addrEl = container.querySelector('p.font-mono') ||
-                       container.parentElement?.querySelector('p.font-mono');
-        const address = addrEl ? addrEl.textContent.trim() : 'unknown';
-
-        // Find symbol: look for text like "NVDAon" near the description
-        const allText = container.parentElement?.innerText || container.innerText;
-        const lines = allText.split('\n').map((l) => l.trim()).filter(Boolean);
-        const descIdx = lines.findIndex((l) => l.includes('Ondo Tokenized'));
-
-        let symbol = '';
-        let name = '';
-        if (descIdx >= 1) {
-          name = lines[descIdx - 1]; // e.g. "NVDAon"
-          symbol = name.replace(/on$/, ''); // e.g. "NVDA"
-        }
-
-        if (symbol && name) {
-          results.push({ symbol, name, description: descText, address });
-        }
-      });
-
-      // Strategy 2 (fallback): Regex on full page text with \n+ separators
-      if (results.length === 0) {
-        const allText = document.body.innerText;
-        const regex = /([A-Z]{2,6})\n+([A-Z]{2,6}on)\n+(.+?\(Ondo Tokenized\))\n+(0x[a-fA-F0-9]{4}[.\u2026]{1,3}[a-fA-F0-9]{4})/g;
-        let match;
-        while ((match = regex.exec(allText)) !== null) {
-          results.push({
-            symbol: match[1],
-            name: match[2],
-            description: match[3].trim(),
-            address: match[4],
-          });
-        }
+      let match;
+      while ((match = regex.exec(allText)) !== null) {
+        results.push({
+          symbol: match[1],
+          name: match[2],
+          description: match[3].trim(),
+          address: match[4],
+        });
       }
 
       // Deduplicate by symbol
