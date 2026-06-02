@@ -16,6 +16,7 @@ let browser = null;
 let page = null;
 let knownAssets = new Map(); // symbol -> { name, address }
 let baselineEstablished = false; // true after first successful scrape has been processed
+let isPolling = false;
 let consecutiveErrors = 0;
 const MAX_CONSECUTIVE_ERRORS = 10;
 
