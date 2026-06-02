@@ -42,7 +42,7 @@ function saveState() {
 }
 
 // --- Feishu notification ---
-async function sendFeishu(title, content) {
+async function sendFeishu(title, content, template = 'red') {
   if (!FEISHU_WEBHOOK_URL) {
     console.warn('[FEISHU] No webhook URL configured, skipping notification');
     return;
@@ -53,7 +53,7 @@ async function sendFeishu(title, content) {
       card: {
         header: {
           title: { tag: 'plain_text', content: title },
-          template: 'red',
+          template: template,
         },
         elements: [
           {
@@ -99,7 +99,7 @@ async function notifyNewStock(stock) {
     `**合约地址：** ${stock.address}`,
     `**发现时间：** ${new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}`,
   ].join('\n');
-  await sendFeishu(title, content);
+  await sendFeishu(title, content, 'red');
 }
 
 async function notifyStartup(assets) {
@@ -110,12 +110,12 @@ async function notifyStartup(assets) {
     `**当前已知股票（${assets.length}只）：**`,
     list,
   ].join('\n');
-  await sendFeishu(title, content);
+  await sendFeishu(title, content, 'green');
 }
 
 async function notifyError(msg) {
   const title = '⚠️ Flap 监控异常';
-  await sendFeishu(title, `**错误信息：** ${msg}`);
+  await sendFeishu(title, `**错误信息：** ${msg}`, 'orange');
 }
 
 // --- Browser management ---
@@ -159,6 +159,11 @@ async function closeBrowser() {
 
 // --- Page scraping ---
 async function scrapeAssets() {
+  if (!page) {
+    console.warn('[SCRAPE] No browser page available, reinitializing...');
+    await closeBrowser();
+    await initBrowser();
+  }
   try {
     await page.goto(FLAP_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
     await new Promise((r) => setTimeout(r, PAGE_WAIT));
@@ -254,7 +259,6 @@ async function poll() {
         await notifyError(`连续 ${MAX_CONSECUTIVE_ERRORS} 次未能获取资产列表，请检查监控脚本`);
         consecutiveErrors = 0; // Reset to avoid spamming
       }
-      isPolling = false;
       return;
     }
 
@@ -287,15 +291,27 @@ async function poll() {
   } catch (err) {
     console.error('[POLL] Unexpected error:', err.message);
     consecutiveErrors++;
+  } finally {
+    isPolling = false;
   }
-
-  isPolling = false;
 }
 
 function startPolling() {
   console.log(`[POLL] Starting with interval ${POLL_INTERVAL}ms`);
-  setInterval(poll, POLL_INTERVAL);
+  const loop = async () => {
+    await poll();
+    setTimeout(loop, POLL_INTERVAL);
+  };
+  setTimeout(loop, POLL_INTERVAL);
 }
+
+// --- Global error handlers ---
+process.on('unhandledRejection', (reason) => {
+  console.error('[FATAL] Unhandled rejection:', reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('[FATAL] Uncaught exception:', err.message);
+});
 
 // --- Main entry ---
 async function main() {
