@@ -9,6 +9,7 @@ const FEISHU_WEBHOOK_URL = process.env.FEISHU_WEBHOOK_URL;
 const FLAP_URL = process.env.FLAP_URL || 'https://flap.sh/launch?vaultfactory=0xf8aC088F06D155f3C3F531f1Ef80B14f1604530a';
 const POLL_INTERVAL = parseInt(process.env.POLL_INTERVAL, 10) || 5000;
 const PAGE_WAIT = parseInt(process.env.PAGE_WAIT, 10) || 8000;
+const SCRAPE_TIMEOUT = Math.max(PAGE_WAIT, 5000);
 const STATE_FILE = path.join(__dirname, 'known_assets.json');
 
 // --- Chinese name mapping ---
@@ -244,6 +245,63 @@ async function closeBrowser() {
   }
 }
 
+async function extractAssetsFromPage() {
+  return page.evaluate(() => {
+    const isSymbol = (value) => /^[A-Z0-9]{1,10}$/.test(value);
+    const isStableTokenName = (value) => /^[A-Z0-9]{2,10}on$/.test(value);
+
+    const cards = [...document.querySelectorAll('button')]
+      .map((card) => {
+        const symbol = card.querySelector('div.grid.font-mono')?.textContent.trim() || '';
+        const name = card.querySelector('p.truncate.text-sm.font-semibold')?.textContent.trim() || '';
+        const description = card.querySelector('p.mt-0\\.5.truncate')?.textContent.trim() || '';
+        const address = [...card.querySelectorAll('p.font-mono')]
+          .map((el) => el.textContent.trim())
+          .find((text) => text.startsWith('0x')) || '';
+
+        return { symbol, name, description, address };
+      })
+      .filter((asset) =>
+        isSymbol(asset.symbol) &&
+        isStableTokenName(asset.name) &&
+        asset.description.includes('Ondo Tokenized') &&
+        asset.address.startsWith('0x')
+      );
+
+    const seen = new Set();
+    return cards.filter((asset) => {
+      if (seen.has(asset.symbol)) return false;
+      seen.add(asset.symbol);
+      return true;
+    });
+  });
+}
+
+async function waitForStableAssets(timeoutMs = SCRAPE_TIMEOUT) {
+  const deadline = Date.now() + timeoutMs;
+  let lastSignature = '';
+  let stableReads = 0;
+  let lastAssets = [];
+
+  while (Date.now() < deadline) {
+    const assets = await extractAssetsFromPage();
+    const signature = assets.map((a) => `${a.symbol}:${a.name}:${a.address}`).join('|');
+
+    if (assets.length > 0 && signature === lastSignature) {
+      stableReads++;
+      if (stableReads >= 2) return assets;
+    } else {
+      stableReads = 1;
+      lastSignature = signature;
+      lastAssets = assets;
+    }
+
+    await new Promise((r) => setTimeout(r, 300));
+  }
+
+  return lastAssets;
+}
+
 // --- Page scraping ---
 async function scrapeAssets() {
   if (!page) {
@@ -253,60 +311,20 @@ async function scrapeAssets() {
   }
   try {
     await page.goto(FLAP_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
-    await new Promise((r) => setTimeout(r, PAGE_WAIT));
+    const assets = await waitForStableAssets();
 
-    // Extract asset data using DOM structure (not regex on text).
-    // The page has two sets of elements in matching order:
-    //   1. Symbol badges: div.grid.font-mono (text = "NVDA")
-    //      followed by address: p.font-mono.text-white\/45 (text = "0xA9eE...6F75")
-    //   2. Name rows: p.truncate.text-sm.font-semibold (text = "NVDAon")
-    //      followed by description: p.mt-0\.5.truncate (text = "NVIDIA (Ondo Tokenized)")
-    // We query both sets and zip them together by index.
-    const assets = await page.evaluate(() => {
-      // Get symbol badges — div elements that are grid + font-mono + 40px square
-      const symbolEls = document.querySelectorAll('div.grid.font-mono');
-      // Get address elements
-      const addrEls = document.querySelectorAll('p.font-mono');
-      // Get name elements — p with truncate + text-sm + font-semibold
-      const nameEls = document.querySelectorAll('p.truncate.text-sm.font-semibold');
-      // Get description elements — p with mt-0.5 + truncate
-      const descEls = document.querySelectorAll('p.mt-0\\.5.truncate');
-
-      // Filter symbol badges: must contain only short uppercase text (the symbol)
-      const symbols = [];
-      const addresses = [];
-      symbolEls.forEach((el) => {
-        const text = el.textContent.trim();
-        if (/^[A-Z0-9]{1,10}$/.test(text)) {
-          symbols.push(text);
-        }
-      });
-
-      // Filter address elements: must start with 0x
-      addrEls.forEach((el) => {
-        const text = el.textContent.trim();
-        if (text.startsWith('0x')) {
-          addresses.push(text);
-        }
-      });
-
-      const names = [...nameEls].map((el) => el.textContent.trim());
-      const descs = [...descEls].map((el) => el.textContent.trim());
-
-      // Zip: the three arrays should have the same length
-      const count = Math.min(symbols.length, names.length, addresses.length);
-      const results = [];
-      for (let i = 0; i < count; i++) {
-        results.push({
-          symbol: symbols[i],
-          name: names[i],
-          description: descs[i] || '',
-          address: addresses[i],
-        });
-      }
-
-      return results;
-    });
+    if (!assets || assets.length === 0) {
+      const diagnostics = await page.evaluate(() => ({
+        url: location.href,
+        title: document.title,
+        symbolEls: document.querySelectorAll('div.grid.font-mono').length,
+        addrEls: document.querySelectorAll('p.font-mono').length,
+        nameEls: document.querySelectorAll('p.truncate.text-sm.font-semibold').length,
+        descEls: document.querySelectorAll('p.mt-0\\.5.truncate').length,
+        body: document.body?.innerText?.slice(0, 240) || '',
+      }));
+      console.warn('[SCRAPE] Empty stable result:', JSON.stringify(diagnostics));
+    }
 
     return assets;
   } catch (err) {
