@@ -6,8 +6,8 @@ const path = require('path');
 
 // --- Config ---
 const FEISHU_WEBHOOK_URL = process.env.FEISHU_WEBHOOK_URL;
-const FLAP_URL = process.env.FLAP_URL || 'https://flap.sh/launch?vaultfactory=0xf8aC088F06D155f3C3F531f1Ef80B14f1604530a';
-const POLL_INTERVAL = parseInt(process.env.POLL_INTERVAL, 10) || 5000;
+const FLAP_URL = process.env.FLAP_URL || 'https://flap.sh/launch?vaultfactory=0x40a9a2fda017e0923ea0b403f2f063f9e51168fb';
+const POLL_INTERVAL = parseInt(process.env.POLL_INTERVAL, 10) || 1500;
 const PAGE_WAIT = parseInt(process.env.PAGE_WAIT, 10) || 8000;
 const SCRAPE_TIMEOUT = Math.max(PAGE_WAIT, 5000);
 const STATE_FILE = path.join(__dirname, 'known_assets.json');
@@ -250,21 +250,34 @@ async function extractAssetsFromPage() {
     const isSymbol = (value) => /^[A-Z0-9]{1,10}$/.test(value);
     const isStableTokenName = (value) => /^[A-Z0-9]{2,10}on$/.test(value);
 
-    const cards = [...document.querySelectorAll('button')]
+    const cards = [...document.querySelectorAll('button, [role="button"]')]
       .map((card) => {
-        const symbol = card.querySelector('div.grid.font-mono')?.textContent.trim() || '';
-        const name = card.querySelector('p.truncate.text-sm.font-semibold')?.textContent.trim() || '';
-        const description = card.querySelector('p.mt-0\\.5.truncate')?.textContent.trim() || '';
+        const lines = (card.innerText || '')
+          .split(/\n+/)
+          .map((line) => line.trim())
+          .filter(Boolean);
+
+        const symbol = card.querySelector('div.grid.font-mono')?.textContent.trim() ||
+          lines.find((line) => isSymbol(line)) ||
+          '';
+        const name = card.querySelector('p.truncate.text-sm.font-semibold')?.textContent.trim() ||
+          lines.find((line) => isStableTokenName(line)) ||
+          '';
+        const description = card.querySelector('p.mt-0\\.5.truncate')?.textContent.trim() ||
+          lines.find((line) => /\bTokenized\b/i.test(line)) ||
+          '';
         const address = [...card.querySelectorAll('p.font-mono')]
           .map((el) => el.textContent.trim())
-          .find((text) => text.startsWith('0x')) || '';
+          .find((text) => text.startsWith('0x')) ||
+          lines.find((line) => line.startsWith('0x')) ||
+          '';
 
         return { symbol, name, description, address };
       })
       .filter((asset) =>
         isSymbol(asset.symbol) &&
         isStableTokenName(asset.name) &&
-        asset.description.includes('Ondo Tokenized') &&
+        /\bTokenized\b/i.test(asset.description) &&
         asset.address.startsWith('0x')
       );
 

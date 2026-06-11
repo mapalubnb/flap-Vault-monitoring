@@ -87,10 +87,10 @@ nano .env
 FEISHU_WEBHOOK_URL=https://open.feishu.cn/open-apis/bot/v2/hook/YOUR_WEBHOOK_KEY
 
 # 监控目标页面（可选，默认已设置）
-FLAP_URL=https://flap.sh/launch?vaultfactory=0xf8aC088F06D155f3C3F531f1Ef80B14f1604530a
+FLAP_URL=https://flap.sh/launch?vaultfactory=0x40a9a2fda017e0923ea0b403f2f063f9e51168fb
 
-# 轮询间隔，单位毫秒（可选，默认 5000）
-POLL_INTERVAL=5000
+# 轮询间隔，单位毫秒（可选，默认 1500）
+POLL_INTERVAL=1500
 
 # 页面等待渲染时间，单位毫秒（可选，默认 8000）
 PAGE_WAIT=8000
