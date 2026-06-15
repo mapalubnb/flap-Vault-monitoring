@@ -11,6 +11,7 @@ const POLL_INTERVAL = parseInt(process.env.POLL_INTERVAL, 10) || 1500;
 const PAGE_WAIT = parseInt(process.env.PAGE_WAIT, 10) || 8000;
 const SCRAPE_TIMEOUT = Math.max(PAGE_WAIT, 5000);
 const STATE_FILE = path.join(__dirname, 'known_assets.json');
+const DEBUG_SNAPSHOT_FILE = path.join(__dirname, 'debug-flap-empty.html');
 
 // --- Chinese name mapping ---
 // Built-in cache for common US stocks (translation APIs can't reliably translate proper nouns)
@@ -98,6 +99,7 @@ let knownAssets = new Map(); // symbol -> { name, address }
 let baselineEstablished = false; // true after first successful scrape has been processed
 let isPolling = false;
 let consecutiveErrors = 0;
+let lastDebugSnapshotAt = 0;
 const MAX_CONSECUTIVE_ERRORS = 10;
 
 // --- State persistence ---
@@ -298,6 +300,47 @@ async function extractAssetsFromPage() {
       return normalizeAsset({ symbol, name, description, address });
     }
 
+    function parseAssetsFromBlob(text) {
+      const blob = clean(text);
+      if (!blob) return [];
+
+      const assets = [];
+      const addresses = [...blob.matchAll(ADDRESS_RE)].map((match) => ({
+        value: match[0],
+        index: match.index || 0,
+      }));
+
+      for (const address of addresses) {
+        const start = Math.max(0, address.index - 2500);
+        const end = Math.min(blob.length, address.index + 2500);
+        const windowText = blob.slice(start, end);
+        const tokenMatches = [...windowText.matchAll(TOKEN_RE)];
+
+        for (const tokenMatch of tokenMatches) {
+          const name = tokenMatch[0];
+          const symbol = name.slice(0, -2);
+          const tokenIndex = tokenMatch.index || 0;
+          const localStart = Math.max(0, tokenIndex - 700);
+          const localEnd = Math.min(windowText.length, tokenIndex + 700);
+          const localText = windowText.slice(localStart, localEnd);
+          const description =
+            localText.match(/[A-Za-z0-9 .,&'-]{2,120}\s*\([^)]*Tokenized[^)]*\)/i)?.[0] ||
+            localText.match(/[A-Za-z0-9 .,&'-]{2,120}\s+Tokenized[A-Za-z0-9 .,&'-]{0,80}/i)?.[0] ||
+            `${symbol} Tokenized`;
+
+          const asset = normalizeAsset({
+            symbol,
+            name,
+            description,
+            address: address.value,
+          });
+          if (asset) assets.push(asset);
+        }
+      }
+
+      return assets;
+    }
+
     const candidates = [];
 
     // Current and older flap layouts have used buttons, anchors, and plain card containers.
@@ -366,6 +409,8 @@ async function extractAssetsFromPage() {
       if (asset) candidates.push(asset);
     });
 
+    candidates.push(...parseAssetsFromBlob(document.documentElement?.outerHTML || ''));
+
     const seen = new Set();
     return candidates.filter((asset) => {
       const key = `${asset.symbol}:${asset.address.toLowerCase()}`;
@@ -416,16 +461,26 @@ async function scrapeAssets() {
       const diagnostics = await page.evaluate(() => ({
         url: location.href,
         title: document.title,
+        isCreateTokenPage:
+          /\bCreate Token\b/i.test(document.body?.innerText || '') &&
+          /\bToken Name\b/i.test(document.body?.innerText || '') &&
+          /\bToken Symbol\b/i.test(document.body?.innerText || ''),
         symbolEls: document.querySelectorAll('div.grid.font-mono').length,
         addrEls: document.querySelectorAll('p.font-mono').length,
         genericAddrMatches: (document.body?.innerText?.match(/0x[a-fA-F0-9]{40}/g) || []).length,
+        htmlAddrMatches: (document.documentElement?.outerHTML?.match(/0x[a-fA-F0-9]{40}/g) || []).length,
         tokenMatches: (document.body?.innerText?.match(/\b[A-Z0-9]{2,15}on\b/g) || []).length,
+        htmlTokenMatches: (document.documentElement?.outerHTML?.match(/\b[A-Z0-9]{2,15}on\b/g) || []).length,
         buttonLikeEls: document.querySelectorAll('button, [role="button"], a, article, li').length,
         nameEls: document.querySelectorAll('p.truncate.text-sm.font-semibold').length,
         descEls: document.querySelectorAll('p.mt-0\\.5.truncate').length,
         body: document.body?.innerText?.slice(0, 240) || '',
       }));
       console.warn('[SCRAPE] Empty stable result:', JSON.stringify(diagnostics));
+      if (diagnostics.isCreateTokenPage) {
+        console.warn('[SCRAPE] Target URL rendered a Create Token form instead of the Vault Factory asset list. FLAP_URL may be stale or redirected by the current flap.sh frontend.');
+      }
+      await saveDebugSnapshot();
     }
 
     return assets;
@@ -438,6 +493,20 @@ async function scrapeAssets() {
       await initBrowser();
     }
     return null;
+  }
+}
+
+async function saveDebugSnapshot() {
+  const now = Date.now();
+  if (now - lastDebugSnapshotAt < 10 * 60 * 1000) return;
+  lastDebugSnapshotAt = now;
+
+  try {
+    const html = await page.content();
+    fs.writeFileSync(DEBUG_SNAPSHOT_FILE, html);
+    console.warn(`[SCRAPE] Saved debug snapshot to ${DEBUG_SNAPSHOT_FILE}`);
+  } catch (err) {
+    console.warn('[SCRAPE] Failed to save debug snapshot:', err.message);
   }
 }
 
