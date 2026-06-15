@@ -249,7 +249,14 @@ async function closeBrowser() {
 
 async function extractAssetsFromPage() {
   return page.evaluate(() => {
-    const ADDRESS_RE = /0x[a-fA-F0-9]{40}/;
+    // Full 40-hex address OR the truncated UI form `0x390a...18c4` (flap.sh v2 layout
+    // only renders truncated addresses in the DOM; full addresses are loaded into
+    // client-side state and never reach the rendered HTML).
+    const FULL_ADDRESS_RE = /0x[a-fA-F0-9]{40}/;
+    const TRUNC_ADDRESS_RE = /0x[a-fA-F0-9]{3,10}\.{2,4}[a-fA-F0-9]{3,10}/;
+    const ANY_ADDRESS_RE = new RegExp(
+      `(${FULL_ADDRESS_RE.source})|(${TRUNC_ADDRESS_RE.source})`
+    );
     const TOKEN_RE = /\b[A-Z0-9]{2,15}on\b/;
 
     const clean = (value = '') =>
@@ -265,25 +272,29 @@ async function extractAssetsFromPage() {
     const textOf = (el) => clean(el?.innerText || el?.textContent || '');
     const isSymbol = (value) => /^[A-Z0-9.]{1,12}$/.test(value);
     const isStableTokenName = (value) => /^[A-Z0-9]{2,15}on$/.test(value);
+    const matchAddress = (value = '') => value.match(ANY_ADDRESS_RE)?.[0] || '';
 
     function normalizeAsset(asset) {
       const name = clean(asset.name);
-      const address = clean(asset.address).match(ADDRESS_RE)?.[0] || '';
+      const address = matchAddress(clean(asset.address));
       let symbol = clean(asset.symbol).replace(/[^A-Z0-9.]/g, '');
       const symbolFromToken = isStableTokenName(name) ? name.slice(0, -2) : '';
-      if (symbolFromToken && symbol !== symbolFromToken) {
-        symbol = name.slice(0, -2);
-      }
+      // The visible symbol pill (e.g. "GOOG") sometimes differs from the token-name
+      // root (e.g. "GOOGLon" -> "GOOGL"); the token-name root is the authoritative
+      // identifier used in known_assets.json.
+      if (symbolFromToken) symbol = symbolFromToken;
+
       const description = clean(asset.description) || `${symbol || name} Tokenized`;
 
-      if (!isSymbol(symbol) || !isStableTokenName(name) || !address) return null;
+      // Address may be absent for very transient renders; require name + symbol at minimum.
+      if (!isSymbol(symbol) || !isStableTokenName(name)) return null;
       return { symbol, name, description, address };
     }
 
     function parseAssetFromText(text) {
       const lines = linesFrom(text);
       const joined = lines.join('\n');
-      const address = joined.match(ADDRESS_RE)?.[0] || '';
+      const address = matchAddress(joined);
       const name =
         lines.find((line) => isStableTokenName(line)) ||
         joined.match(TOKEN_RE)?.[0] ||
@@ -295,57 +306,49 @@ async function extractAssetsFromPage() {
       const description =
         lines.find((line) => /\bTokenized\b/i.test(line)) ||
         lines.find((line) => /\bOndo\b/i.test(line)) ||
+        lines.find((line) => /\bbStocks?\b/i.test(line)) ||
         '';
 
       return normalizeAsset({ symbol, name, description, address });
     }
 
-    function parseAssetsFromBlob(text) {
-      const blob = clean(text);
-      if (!blob) return [];
-
-      const assets = [];
-      const addresses = [...blob.matchAll(ADDRESS_RE)].map((match) => ({
-        value: match[0],
-        index: match.index || 0,
-      }));
-
-      for (const address of addresses) {
-        const start = Math.max(0, address.index - 2500);
-        const end = Math.min(blob.length, address.index + 2500);
-        const windowText = blob.slice(start, end);
-        const tokenMatches = [...windowText.matchAll(TOKEN_RE)];
-
-        for (const tokenMatch of tokenMatches) {
-          const name = tokenMatch[0];
-          const symbol = name.slice(0, -2);
-          const tokenIndex = tokenMatch.index || 0;
-          const localStart = Math.max(0, tokenIndex - 700);
-          const localEnd = Math.min(windowText.length, tokenIndex + 700);
-          const localText = windowText.slice(localStart, localEnd);
-          const description =
-            localText.match(/[A-Za-z0-9 .,&'-]{2,120}\s*\([^)]*Tokenized[^)]*\)/i)?.[0] ||
-            localText.match(/[A-Za-z0-9 .,&'-]{2,120}\s+Tokenized[A-Za-z0-9 .,&'-]{0,80}/i)?.[0] ||
-            `${symbol} Tokenized`;
-
-          const asset = normalizeAsset({
-            symbol,
-            name,
-            description,
-            address: address.value,
-          });
-          if (asset) assets.push(asset);
-        }
-      }
-
-      return assets;
-    }
-
     const candidates = [];
 
-    // Current and older flap layouts have used buttons, anchors, and plain card containers.
+    // ---- Strategy 1: target the current v2 supported-assets buttons directly. ----
+    // Each asset is a <button aria-pressed="true|false"> containing:
+    //   <div ...>SYMBOL</div>
+    //   <span class="block truncate text-sm font-semibold text-white">SYMBOLon</span>
+    //   <span class="mt-0.5 block truncate text-xs ...">Description (Ondo Tokenized)</span>
+    //   <span class="font-mono text-xs ...">0xXXXX...YYYY</span>
+    const v2Buttons = document.querySelectorAll(
+      'button[aria-pressed], button[role="tab"], button'
+    );
+    for (const btn of v2Buttons) {
+      const nameNode = btn.querySelector(
+        'span.text-sm.font-semibold, span.truncate.text-sm.font-semibold, p.truncate.text-sm.font-semibold'
+      );
+      const name = clean(nameNode?.textContent || '');
+      if (!isStableTokenName(name)) continue;
+
+      const symbolNode = btn.querySelector('div.font-mono, div.grid.font-mono, [class*="font-mono"]');
+      const descNode = btn.querySelector(
+        'span.mt-0\\.5, span.truncate.text-xs, p.mt-0\\.5.truncate'
+      );
+      const addressNode = [...btn.querySelectorAll('span.font-mono, p.font-mono, [class*="font-mono"], code')]
+        .map((el) => clean(el.textContent || ''))
+        .find((t) => ANY_ADDRESS_RE.test(t));
+
+      const asset = normalizeAsset({
+        symbol: clean(symbolNode?.textContent || '') || name.slice(0, -2),
+        name,
+        description: clean(descNode?.textContent || ''),
+        address: addressNode || matchAddress(textOf(btn)),
+      });
+      if (asset) candidates.push(asset);
+    }
+
+    // ---- Strategy 2: legacy layouts (cards/anchors/articles). ----
     const cardSelectors = [
-      'button',
       '[role="button"]',
       'a',
       'article',
@@ -354,74 +357,66 @@ async function extractAssetsFromPage() {
       '[data-testid*="vault" i]',
       '[class*="card" i]',
     ].join(',');
-
     for (const card of document.querySelectorAll(cardSelectors)) {
-      const lines = linesFrom(textOf(card));
-      const symbol =
-        clean(card.querySelector('div.grid.font-mono')?.textContent) ||
-        lines.find((line) => isSymbol(line)) ||
-        '';
-      const name =
-        clean(card.querySelector('p.truncate.text-sm.font-semibold')?.textContent) ||
-        lines.find((line) => isStableTokenName(line)) ||
-        textOf(card).match(TOKEN_RE)?.[0] ||
-        '';
-      const description =
-        clean(card.querySelector('p.mt-0\\.5.truncate')?.textContent) ||
-        lines.find((line) => /\bTokenized\b/i.test(line)) ||
-        lines.find((line) => /\bOndo\b/i.test(line)) ||
-        '';
-      const address =
-        [...card.querySelectorAll('p.font-mono, [class*="font-mono" i], code')]
-          .map(textOf)
-          .find((text) => ADDRESS_RE.test(text)) ||
-        textOf(card).match(ADDRESS_RE)?.[0] ||
-        '';
-
-      const asset = normalizeAsset({ symbol, name, description, address });
+      const asset = parseAssetFromText(textOf(card));
       if (asset) candidates.push(asset);
     }
 
-    // Fallback: start from any visible contract address and climb to the closest
-    // ancestor that also contains a token name. This survives markup/class changes.
-    const addressElements = [...document.querySelectorAll('body *')].filter((el) =>
-      ADDRESS_RE.test(textOf(el))
-    );
-    for (const el of addressElements) {
+    // ---- Strategy 3: walk up from any element holding a token name. ----
+    const tokenNameEls = [...document.querySelectorAll('body *')].filter((el) => {
+      const t = textOf(el);
+      return isStableTokenName(t) && t.length < 30;
+    });
+    for (const el of tokenNameEls) {
       let node = el;
-      while (node && node !== document.body) {
+      for (let depth = 0; node && node !== document.body && depth < 8; depth++) {
         const text = textOf(node);
-        if (ADDRESS_RE.test(text) && TOKEN_RE.test(text) && text.length < 3000) {
+        if (TOKEN_RE.test(text) && text.length < 3000) {
           const asset = parseAssetFromText(text);
-          if (asset) candidates.push(asset);
-          break;
+          if (asset) {
+            candidates.push(asset);
+            break;
+          }
         }
         node = node.parentElement;
       }
     }
 
-    // Last resort: parse windows of nearby visible text around token names/addresses.
+    // ---- Strategy 4: full-page text sliding window (last resort). ----
     const bodyLines = linesFrom(document.body?.innerText || '');
     bodyLines.forEach((line, index) => {
-      if (!ADDRESS_RE.test(line) && !TOKEN_RE.test(line)) return;
+      if (!TOKEN_RE.test(line) && !ANY_ADDRESS_RE.test(line)) return;
       const windowText = bodyLines.slice(Math.max(0, index - 8), index + 9).join('\n');
       const asset = parseAssetFromText(windowText);
       if (asset) candidates.push(asset);
     });
 
-    candidates.push(...parseAssetsFromBlob(document.documentElement?.outerHTML || ''));
-
-    const seen = new Set();
-    return candidates.filter((asset) => {
-      const key = `${asset.symbol}:${asset.address.toLowerCase()}`;
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    });
+    // De-dup by token name (e.g. "AAPLon"). When the same asset is seen
+    // multiple times prefer the variant that has an address.
+    const byName = new Map();
+    for (const asset of candidates) {
+      const key = asset.name;
+      const prev = byName.get(key);
+      if (!prev || (!prev.address && asset.address)) byName.set(key, asset);
+    }
+    return [...byName.values()];
   });
 }
 
 async function waitForStableAssets(timeoutMs = SCRAPE_TIMEOUT) {
+  // Try to wait until at least one supported-asset row is rendered. This selector
+  // matches the current v2 layout (`<span class="block truncate text-sm font-semibold ...">SYMBOLon</span>`)
+  // but we silently fall back to polling if it never appears so we still survive
+  // future markup changes.
+  try {
+    await page.waitForFunction(
+      () => /\b[A-Z0-9]{2,15}on\b/.test(document.body?.innerText || ''),
+      { timeout: Math.min(timeoutMs, 8000) }
+    );
+  } catch (_) {
+    /* fall through to polling */
+  }
+
   const deadline = Date.now() + timeoutMs;
   let lastSignature = '';
   let stableReads = 0;
@@ -458,27 +453,35 @@ async function scrapeAssets() {
     const assets = await waitForStableAssets();
 
     if (!assets || assets.length === 0) {
-      const diagnostics = await page.evaluate(() => ({
-        url: location.href,
-        title: document.title,
-        isCreateTokenPage:
-          /\bCreate Token\b/i.test(document.body?.innerText || '') &&
-          /\bToken Name\b/i.test(document.body?.innerText || '') &&
-          /\bToken Symbol\b/i.test(document.body?.innerText || ''),
-        symbolEls: document.querySelectorAll('div.grid.font-mono').length,
-        addrEls: document.querySelectorAll('p.font-mono').length,
-        genericAddrMatches: (document.body?.innerText?.match(/0x[a-fA-F0-9]{40}/g) || []).length,
-        htmlAddrMatches: (document.documentElement?.outerHTML?.match(/0x[a-fA-F0-9]{40}/g) || []).length,
-        tokenMatches: (document.body?.innerText?.match(/\b[A-Z0-9]{2,15}on\b/g) || []).length,
-        htmlTokenMatches: (document.documentElement?.outerHTML?.match(/\b[A-Z0-9]{2,15}on\b/g) || []).length,
-        buttonLikeEls: document.querySelectorAll('button, [role="button"], a, article, li').length,
-        nameEls: document.querySelectorAll('p.truncate.text-sm.font-semibold').length,
-        descEls: document.querySelectorAll('p.mt-0\\.5.truncate').length,
-        body: document.body?.innerText?.slice(0, 240) || '',
-      }));
+      const diagnostics = await page.evaluate(() => {
+        const body = document.body?.innerText || '';
+        const html = document.documentElement?.outerHTML || '';
+        const hasSupportedHeading = /Supported Assets/i.test(body);
+        const hasCreateTokenForm =
+          /\bCreate Token\b/i.test(body) &&
+          /\bToken Name\b/i.test(body) &&
+          /\bToken Symbol\b/i.test(body);
+        return {
+          url: location.href,
+          title: document.title,
+          // Real failure only if the Create Token form rendered AND the
+          // Supported Assets section is missing entirely.
+          isStandaloneCreateTokenPage: hasCreateTokenForm && !hasSupportedHeading,
+          hasSupportedHeading,
+          v2ButtonEls: document.querySelectorAll('button[aria-pressed]').length,
+          symbolPillEls: document.querySelectorAll('div.font-mono').length,
+          addrEls: document.querySelectorAll('span.font-mono, p.font-mono').length,
+          fullAddrMatches: (body.match(/0x[a-fA-F0-9]{40}/g) || []).length,
+          truncAddrMatches: (body.match(/0x[a-fA-F0-9]{3,10}\.{2,4}[a-fA-F0-9]{3,10}/g) || []).length,
+          tokenMatches: (body.match(/\b[A-Z0-9]{2,15}on\b/g) || []).length,
+          htmlTokenMatches: (html.match(/\b[A-Z0-9]{2,15}on\b/g) || []).length,
+          buttonLikeEls: document.querySelectorAll('button, [role="button"], a, article, li').length,
+          body: body.slice(0, 240),
+        };
+      });
       console.warn('[SCRAPE] Empty stable result:', JSON.stringify(diagnostics));
-      if (diagnostics.isCreateTokenPage) {
-        console.warn('[SCRAPE] Target URL rendered a Create Token form instead of the Vault Factory asset list. FLAP_URL may be stale or redirected by the current flap.sh frontend.');
+      if (diagnostics.isStandaloneCreateTokenPage) {
+        console.warn('[SCRAPE] Target URL rendered a Create Token form WITHOUT a Supported Assets section. FLAP_URL may be stale or the vault factory was deprecated by the current flap.sh frontend.');
       }
       await saveDebugSnapshot();
     }
