@@ -40,7 +40,25 @@ const CHINESE_NAMES = {
   'ADBE': 'Adobe', 'PYPL': 'PayPal贝宝',
   'IBM': 'IBM', 'CSCO': '思科', 'Cisco': '思科',
   'TSM': '台积电', 'SONY': '索尼', 'TM': '丰田',
+  'SPCX': 'SpaceX', 'SpaceX': 'SpaceX',
 };
+
+// Map flap.sh token-name suffix to issuer information.
+//   "AAPLon" -> Ondo Finance
+//   "NVDAB"  -> Backed Finance (bStocks)
+function getIssuerInfo(tokenName = '') {
+  if (/on$/.test(tokenName)) {
+    return { short: 'Ondo', long: 'Ondo Finance', chinese: 'Ondo 代币化' };
+  }
+  if (/B$/.test(tokenName)) {
+    return { short: 'Backed', long: 'Backed Finance', chinese: 'bStocks 代币化' };
+  }
+  return { short: '未知', long: '未知发行方', chinese: '未知发行方' };
+}
+
+function formatChineseTime() {
+  return new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false });
+}
 
 // Try to get Chinese name: first check cache by symbol, then by company name from description
 function getChineseName(symbol, description) {
@@ -103,12 +121,28 @@ let lastDebugSnapshotAt = 0;
 const MAX_CONSECUTIVE_ERRORS = 10;
 
 // --- State persistence ---
+// `knownAssets` is keyed by token NAME (e.g. "AAPLon", "NVDAB"), not by symbol,
+// so multi-issuer assets like NVDAon + NVDAB are tracked as separate entries.
 function loadState() {
   try {
     if (fs.existsSync(STATE_FILE)) {
       const data = JSON.parse(fs.readFileSync(STATE_FILE, 'utf-8'));
-      knownAssets = new Map(Object.entries(data));
+      // Backward-compat: old format keyed entries by symbol (e.g. "AAPL").
+      // Detect and re-key by name (`entry.name`, e.g. "AAPLon").
+      const migrated = {};
+      let migratedCount = 0;
+      for (const [key, value] of Object.entries(data)) {
+        if (!value || typeof value !== 'object') continue;
+        const effectiveKey = /^[A-Z0-9]{3,12}(?:on|B)$/.test(value.name) ? value.name : key;
+        if (effectiveKey !== key) migratedCount++;
+        migrated[effectiveKey] = value;
+      }
+      knownAssets = new Map(Object.entries(migrated));
       console.log(`[STATE] Loaded ${knownAssets.size} known assets: ${[...knownAssets.keys()].join(', ')}`);
+      if (migratedCount > 0) {
+        console.log(`[STATE] Migrated ${migratedCount} legacy symbol-keyed entries to name-keyed format`);
+        saveState();
+      }
     }
   } catch (err) {
     console.error('[STATE] Failed to load state:', err.message);
@@ -157,7 +191,7 @@ async function sendFeishu(title, content, template = 'red') {
           {
             tag: 'note',
             elements: [
-              { tag: 'plain_text', content: `Flap Monitor · ${new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}` },
+              { tag: 'plain_text', content: `Flap 监控 · ${formatChineseTime()}` },
             ],
           },
         ],
@@ -177,12 +211,14 @@ async function sendFeishu(title, content, template = 'red') {
 async function notifyNewStock(stock) {
   const title = '🚨 新增可分红股票！';
   const cnName = await getChineseNameWithFallback(stock.symbol, stock.description);
+  const issuer = getIssuerInfo(stock.name);
   const content = [
-    `**股票符号：** ${stock.symbol}`,
+    `**股票代码：** ${stock.symbol}`,
     `**中文名称：** ${cnName}`,
-    `**Token名称：** ${stock.name}`,
-    `**合约地址：** ${stock.address}`,
-    `**发现时间：** ${new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}`,
+    `**Token 名称：** ${stock.name}`,
+    `**发行方：** ${issuer.long}（${issuer.chinese}）`,
+    `**合约地址：** ${stock.address || '（页面仅暴露截断地址）'}`,
+    `**发现时间：** ${formatChineseTime()}`,
   ].join('\n');
   await sendFeishu(title, content, 'red');
 }
@@ -192,12 +228,13 @@ async function notifyStartup(assets) {
   const lines = [];
   for (const a of assets) {
     const cnName = await getChineseNameWithFallback(a.symbol, a.description);
-    lines.push(`• ${a.symbol}（${cnName}）— ${a.name}`);
+    const issuer = getIssuerInfo(a.name);
+    lines.push(`• ${a.symbol} · ${cnName} · ${a.name}（${issuer.long}）`);
   }
   const list = lines.join('\n');
   const content = [
-    `**轮询间隔：** ${POLL_INTERVAL / 1000}s`,
-    `**当前已知股票（${assets.length}只）：**`,
+    `**轮询间隔：** ${POLL_INTERVAL / 1000} 秒`,
+    `**当前已知股票（共 ${assets.length} 只）：**`,
     list,
   ].join('\n');
   await sendFeishu(title, content, 'green');
@@ -257,7 +294,12 @@ async function extractAssetsFromPage() {
     const ANY_ADDRESS_RE = new RegExp(
       `(${FULL_ADDRESS_RE.source})|(${TRUNC_ADDRESS_RE.source})`
     );
-    const TOKEN_RE = /\b[A-Z0-9]{2,15}on\b/;
+    // Stable-token suffix conventions:
+    //   "AAPLon" -> Ondo Finance tokenized stock
+    //   "NVDAB"  -> Backed Finance ("bStocks") tokenized stock
+    // The supported-assets list groups Ondo + Backed variants under the same
+    // underlying symbol (e.g. NVDA -> NVDAon + NVDAB).
+    const TOKEN_RE = /\b[A-Z0-9]{3,12}(?:on|B)\b/;
 
     const clean = (value = '') =>
       value
@@ -271,14 +313,19 @@ async function extractAssetsFromPage() {
         .filter(Boolean);
     const textOf = (el) => clean(el?.innerText || el?.textContent || '');
     const isSymbol = (value) => /^[A-Z0-9.]{1,12}$/.test(value);
-    const isStableTokenName = (value) => /^[A-Z0-9]{2,15}on$/.test(value);
+    const isStableTokenName = (value) => /^[A-Z0-9]{3,12}(?:on|B)$/.test(value);
+    const stripStableSuffix = (value = '') => {
+      if (/on$/.test(value)) return value.slice(0, -2);
+      if (/B$/.test(value)) return value.slice(0, -1);
+      return '';
+    };
     const matchAddress = (value = '') => value.match(ANY_ADDRESS_RE)?.[0] || '';
 
     function normalizeAsset(asset) {
       const name = clean(asset.name);
       const address = matchAddress(clean(asset.address));
       let symbol = clean(asset.symbol).replace(/[^A-Z0-9.]/g, '');
-      const symbolFromToken = isStableTokenName(name) ? name.slice(0, -2) : '';
+      const symbolFromToken = isStableTokenName(name) ? stripStableSuffix(name) : '';
       // The visible symbol pill (e.g. "GOOG") sometimes differs from the token-name
       // root (e.g. "GOOGLon" -> "GOOGL"); the token-name root is the authoritative
       // identifier used in known_assets.json.
@@ -315,11 +362,18 @@ async function extractAssetsFromPage() {
     const candidates = [];
 
     // ---- Strategy 1: target the current v2 supported-assets buttons directly. ----
-    // Each asset is a <button aria-pressed="true|false"> containing:
-    //   <div ...>SYMBOL</div>
+    // Each single-issuer asset is a <button aria-pressed="true|false"> containing:
+    //   <div ... font-mono ...>SYMBOL</div>
     //   <span class="block truncate text-sm font-semibold text-white">SYMBOLon</span>
     //   <span class="mt-0.5 block truncate text-xs ...">Description (Ondo Tokenized)</span>
     //   <span class="font-mono text-xs ...">0xXXXX...YYYY</span>
+    //
+    // Multi-issuer assets (NVDA / SPCX / TSLA / ...) instead show a "Choose
+    // provider" parent and only render the actual issuer rows once expanded.
+    // Each expanded issuer row is a child <button class="... rounded-[8px] bg-[#384152] ...">:
+    //   <span class="shrink-0 text-sm font-semibold text-white">SYMBOLon|SYMBOLB</span>
+    //   <span class="min-w-0 truncate font-mono text-xs ...">0xXXXX...YYYY</span>
+    //   <span class="mt-2 block truncate text-sm ...">Description</span>
     const v2Buttons = document.querySelectorAll(
       'button[aria-pressed], button[role="tab"], button'
     );
@@ -331,17 +385,26 @@ async function extractAssetsFromPage() {
       if (!isStableTokenName(name)) continue;
 
       const symbolNode = btn.querySelector('div.font-mono, div.grid.font-mono, [class*="font-mono"]');
-      const descNode = btn.querySelector(
-        'span.mt-0\\.5, span.truncate.text-xs, p.mt-0\\.5.truncate'
-      );
+      // Description selectors cover both single-issuer (mt-0.5 / text-xs) AND
+      // child issuer rows (mt-2 / text-sm). We pick the first matching span
+      // whose text is NOT the token name and NOT an address.
+      const descCandidates = [
+        ...btn.querySelectorAll(
+          'span.mt-0\\.5, span.mt-2, span.truncate.text-xs, span.truncate.text-sm, p.mt-0\\.5.truncate'
+        ),
+      ]
+        .map((el) => clean(el.textContent || ''))
+        .filter((t) => t && t !== name && !ANY_ADDRESS_RE.test(t));
+      const description = descCandidates[0] || '';
+
       const addressNode = [...btn.querySelectorAll('span.font-mono, p.font-mono, [class*="font-mono"], code')]
         .map((el) => clean(el.textContent || ''))
         .find((t) => ANY_ADDRESS_RE.test(t));
 
       const asset = normalizeAsset({
-        symbol: clean(symbolNode?.textContent || '') || name.slice(0, -2),
+        symbol: clean(symbolNode?.textContent || '') || stripStableSuffix(name),
         name,
-        description: clean(descNode?.textContent || ''),
+        description,
         address: addressNode || matchAddress(textOf(btn)),
       });
       if (asset) candidates.push(asset);
@@ -405,12 +468,12 @@ async function extractAssetsFromPage() {
 
 async function waitForStableAssets(timeoutMs = SCRAPE_TIMEOUT) {
   // Try to wait until at least one supported-asset row is rendered. This selector
-  // matches the current v2 layout (`<span class="block truncate text-sm font-semibold ...">SYMBOLon</span>`)
-  // but we silently fall back to polling if it never appears so we still survive
-  // future markup changes.
+  // matches the current v2 layout (`<span class="block truncate text-sm font-semibold ...">SYMBOLon</span>`
+  // or the bStocks variant `SYMBOLB`) but we silently fall back to polling if it
+  // never appears so we still survive future markup changes.
   try {
     await page.waitForFunction(
-      () => /\b[A-Z0-9]{2,15}on\b/.test(document.body?.innerText || ''),
+      () => /\b[A-Z0-9]{3,12}(?:on|B)\b/.test(document.body?.innerText || ''),
       { timeout: Math.min(timeoutMs, 8000) }
     );
   } catch (_) {
@@ -442,6 +505,40 @@ async function waitForStableAssets(timeoutMs = SCRAPE_TIMEOUT) {
 }
 
 // --- Page scraping ---
+// Find collapsed "Choose provider" cards and return their visible symbols
+// (e.g. ["NVDA", "SPCX", "TSLA"]).
+async function findCollapsedMultiIssuerSymbols() {
+  return page.evaluate(() => {
+    const out = [];
+    for (const btn of document.querySelectorAll('button')) {
+      const t = (btn.innerText || '').trim();
+      if (!/Choose provider/i.test(t) || !/asset choices/i.test(t)) continue;
+      const symEl = btn.querySelector('div.font-mono, div.grid.font-mono, [class*="font-mono"]');
+      const sym = (symEl?.textContent || '').trim();
+      if (sym) out.push(sym);
+    }
+    return [...new Set(out)];
+  });
+}
+
+// Click the "Choose provider" parent whose pill matches `symbol`. Returns true
+// on success. The page is an accordion: clicking one collapses any other
+// currently-expanded multi-issuer card, so we must scrape children before
+// clicking the next.
+async function clickMultiIssuerParent(symbol) {
+  return page.evaluate((sym) => {
+    for (const btn of document.querySelectorAll('button')) {
+      const t = (btn.innerText || '').trim();
+      if (!/Choose provider/i.test(t) || !/asset choices/i.test(t)) continue;
+      const symEl = btn.querySelector('div.font-mono, div.grid.font-mono, [class*="font-mono"]');
+      if ((symEl?.textContent || '').trim() !== sym) continue;
+      btn.click();
+      return true;
+    }
+    return false;
+  }, symbol);
+}
+
 async function scrapeAssets() {
   if (!page) {
     console.warn('[SCRAPE] No browser page available, reinitializing...');
@@ -450,7 +547,36 @@ async function scrapeAssets() {
   }
   try {
     await page.goto(FLAP_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
-    const assets = await waitForStableAssets();
+    let assets = await waitForStableAssets();
+
+    // For each collapsed multi-issuer parent (e.g. NVDA / SPCX / TSLA), expand
+    // it and merge in any newly-revealed child issuer rows. Expansion is
+    // accordion-style — only one parent can be open at a time — so we click,
+    // scrape, then move on.
+    let multiSymbols = [];
+    try {
+      multiSymbols = await findCollapsedMultiIssuerSymbols();
+    } catch (_) {
+      multiSymbols = [];
+    }
+
+    if (multiSymbols.length > 0) {
+      console.log(`[SCRAPE] Found ${multiSymbols.length} multi-issuer parents: ${multiSymbols.join(', ')}`);
+      const merged = new Map((assets || []).map((a) => [a.name, a]));
+      for (const sym of multiSymbols) {
+        const clicked = await clickMultiIssuerParent(sym);
+        if (!clicked) continue;
+        // Give the accordion a moment to render its child rows.
+        await new Promise((r) => setTimeout(r, 1200));
+        const expanded = await extractAssetsFromPage();
+        for (const a of expanded) {
+          // Prefer entries with an address (later wins only if better).
+          const prev = merged.get(a.name);
+          if (!prev || (!prev.address && a.address)) merged.set(a.name, a);
+        }
+      }
+      assets = [...merged.values()];
+    }
 
     if (!assets || assets.length === 0) {
       const diagnostics = await page.evaluate(() => {
@@ -473,8 +599,8 @@ async function scrapeAssets() {
           addrEls: document.querySelectorAll('span.font-mono, p.font-mono').length,
           fullAddrMatches: (body.match(/0x[a-fA-F0-9]{40}/g) || []).length,
           truncAddrMatches: (body.match(/0x[a-fA-F0-9]{3,10}\.{2,4}[a-fA-F0-9]{3,10}/g) || []).length,
-          tokenMatches: (body.match(/\b[A-Z0-9]{2,15}on\b/g) || []).length,
-          htmlTokenMatches: (html.match(/\b[A-Z0-9]{2,15}on\b/g) || []).length,
+          tokenMatches: (body.match(/\b[A-Z0-9]{3,12}(?:on|B)\b/g) || []).length,
+          htmlTokenMatches: (html.match(/\b[A-Z0-9]{3,12}(?:on|B)\b/g) || []).length,
           buttonLikeEls: document.querySelectorAll('button, [role="button"], a, article, li').length,
           body: body.slice(0, 240),
         };
@@ -532,15 +658,16 @@ async function poll() {
     }
 
     consecutiveErrors = 0;
-    console.log(`[POLL] Found ${assets.length} assets: ${assets.map((a) => a.symbol).join(', ')}`);
+    console.log(`[POLL] Found ${assets.length} assets: ${assets.map((a) => a.name).join(', ')}`);
 
     // If baseline was not established during startup (initial scrape failed),
     // treat the first successful scrape as baseline — not as new assets.
     if (!baselineEstablished) {
       console.log('[POLL] Establishing baseline from first successful scrape...');
       for (const asset of assets) {
-        if (!knownAssets.has(asset.symbol)) {
-          knownAssets.set(asset.symbol, {
+        if (!knownAssets.has(asset.name)) {
+          knownAssets.set(asset.name, {
+            symbol: asset.symbol,
             name: asset.name,
             description: asset.description,
             address: asset.address,
@@ -558,9 +685,10 @@ async function poll() {
     // Check for new assets
     const newAssets = [];
     for (const asset of assets) {
-      if (!knownAssets.has(asset.symbol)) {
+      if (!knownAssets.has(asset.name)) {
         newAssets.push(asset);
-        knownAssets.set(asset.symbol, {
+        knownAssets.set(asset.name, {
+          symbol: asset.symbol,
           name: asset.name,
           description: asset.description,
           address: asset.address,
@@ -570,7 +698,7 @@ async function poll() {
     }
 
     if (newAssets.length > 0) {
-      console.log(`[POLL] 🚨 NEW ASSETS DETECTED: ${newAssets.map((a) => a.symbol).join(', ')}`);
+      console.log(`[POLL] 🚨 NEW ASSETS DETECTED: ${newAssets.map((a) => a.name).join(', ')}`);
       saveState();
 
       // Send notifications for each new asset
@@ -638,9 +766,10 @@ async function main() {
   if (!initialAssets || initialAssets.length === 0) {
     console.error('[MAIN] All initial scrape attempts failed. Will establish baseline on first successful poll.');
     // Send startup notification with previously known assets from state file
-    const knownList = [...knownAssets.entries()].map(([symbol, info]) => ({
-      symbol,
-      name: info.name,
+    const knownList = [...knownAssets.entries()].map(([name, info]) => ({
+      symbol: info.symbol || name.replace(/(on|B)$/, ''),
+      name,
+      description: info.description || '',
     }));
     await notifyStartup(knownList);
     // baselineEstablished stays false — poll() will handle it
@@ -649,9 +778,10 @@ async function main() {
     const newOnes = [];
 
     for (const asset of initialAssets) {
-      if (!knownAssets.has(asset.symbol)) {
+      if (!knownAssets.has(asset.name)) {
         newOnes.push(asset);
-        knownAssets.set(asset.symbol, {
+        knownAssets.set(asset.name, {
+          symbol: asset.symbol,
           name: asset.name,
           description: asset.description,
           address: asset.address,
@@ -669,7 +799,7 @@ async function main() {
 
     // If new assets were found since last run, also send individual alerts
     if (!isFirstRun && newOnes.length > 0) {
-      console.log(`[MAIN] 🚨 New assets since last run: ${newOnes.map((a) => a.symbol).join(', ')}`);
+      console.log(`[MAIN] 🚨 New assets since last run: ${newOnes.map((a) => a.name).join(', ')}`);
       for (const stock of newOnes) {
         await notifyNewStock(stock);
       }
