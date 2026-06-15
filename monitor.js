@@ -247,44 +247,130 @@ async function closeBrowser() {
 
 async function extractAssetsFromPage() {
   return page.evaluate(() => {
-    const isSymbol = (value) => /^[A-Z0-9]{1,10}$/.test(value);
-    const isStableTokenName = (value) => /^[A-Z0-9]{2,10}on$/.test(value);
+    const ADDRESS_RE = /0x[a-fA-F0-9]{40}/;
+    const TOKEN_RE = /\b[A-Z0-9]{2,15}on\b/;
 
-    const cards = [...document.querySelectorAll('button, [role="button"]')]
-      .map((card) => {
-        const lines = (card.innerText || '')
-          .split(/\n+/)
-          .map((line) => line.trim())
-          .filter(Boolean);
+    const clean = (value = '') =>
+      value
+        .replace(/\u00a0/g, ' ')
+        .replace(/[ \t]+/g, ' ')
+        .trim();
+    const linesFrom = (value = '') =>
+      clean(value)
+        .split(/\n+/)
+        .map((line) => clean(line))
+        .filter(Boolean);
+    const textOf = (el) => clean(el?.innerText || el?.textContent || '');
+    const isSymbol = (value) => /^[A-Z0-9.]{1,12}$/.test(value);
+    const isStableTokenName = (value) => /^[A-Z0-9]{2,15}on$/.test(value);
 
-        const symbol = card.querySelector('div.grid.font-mono')?.textContent.trim() ||
-          lines.find((line) => isSymbol(line)) ||
-          '';
-        const name = card.querySelector('p.truncate.text-sm.font-semibold')?.textContent.trim() ||
-          lines.find((line) => isStableTokenName(line)) ||
-          '';
-        const description = card.querySelector('p.mt-0\\.5.truncate')?.textContent.trim() ||
-          lines.find((line) => /\bTokenized\b/i.test(line)) ||
-          '';
-        const address = [...card.querySelectorAll('p.font-mono')]
-          .map((el) => el.textContent.trim())
-          .find((text) => text.startsWith('0x')) ||
-          lines.find((line) => line.startsWith('0x')) ||
-          '';
+    function normalizeAsset(asset) {
+      const name = clean(asset.name);
+      const address = clean(asset.address).match(ADDRESS_RE)?.[0] || '';
+      let symbol = clean(asset.symbol).replace(/[^A-Z0-9.]/g, '');
+      const symbolFromToken = isStableTokenName(name) ? name.slice(0, -2) : '';
+      if (symbolFromToken && symbol !== symbolFromToken) {
+        symbol = name.slice(0, -2);
+      }
+      const description = clean(asset.description) || `${symbol || name} Tokenized`;
 
-        return { symbol, name, description, address };
-      })
-      .filter((asset) =>
-        isSymbol(asset.symbol) &&
-        isStableTokenName(asset.name) &&
-        /\bTokenized\b/i.test(asset.description) &&
-        asset.address.startsWith('0x')
-      );
+      if (!isSymbol(symbol) || !isStableTokenName(name) || !address) return null;
+      return { symbol, name, description, address };
+    }
+
+    function parseAssetFromText(text) {
+      const lines = linesFrom(text);
+      const joined = lines.join('\n');
+      const address = joined.match(ADDRESS_RE)?.[0] || '';
+      const name =
+        lines.find((line) => isStableTokenName(line)) ||
+        joined.match(TOKEN_RE)?.[0] ||
+        '';
+      const symbolFromToken = isStableTokenName(name) ? name.slice(0, -2) : '';
+      const symbol =
+        lines.find((line) => isSymbol(line) && line !== name && line !== symbolFromToken + 'on') ||
+        symbolFromToken;
+      const description =
+        lines.find((line) => /\bTokenized\b/i.test(line)) ||
+        lines.find((line) => /\bOndo\b/i.test(line)) ||
+        '';
+
+      return normalizeAsset({ symbol, name, description, address });
+    }
+
+    const candidates = [];
+
+    // Current and older flap layouts have used buttons, anchors, and plain card containers.
+    const cardSelectors = [
+      'button',
+      '[role="button"]',
+      'a',
+      'article',
+      'li',
+      '[data-testid*="asset" i]',
+      '[data-testid*="vault" i]',
+      '[class*="card" i]',
+    ].join(',');
+
+    for (const card of document.querySelectorAll(cardSelectors)) {
+      const lines = linesFrom(textOf(card));
+      const symbol =
+        clean(card.querySelector('div.grid.font-mono')?.textContent) ||
+        lines.find((line) => isSymbol(line)) ||
+        '';
+      const name =
+        clean(card.querySelector('p.truncate.text-sm.font-semibold')?.textContent) ||
+        lines.find((line) => isStableTokenName(line)) ||
+        textOf(card).match(TOKEN_RE)?.[0] ||
+        '';
+      const description =
+        clean(card.querySelector('p.mt-0\\.5.truncate')?.textContent) ||
+        lines.find((line) => /\bTokenized\b/i.test(line)) ||
+        lines.find((line) => /\bOndo\b/i.test(line)) ||
+        '';
+      const address =
+        [...card.querySelectorAll('p.font-mono, [class*="font-mono" i], code')]
+          .map(textOf)
+          .find((text) => ADDRESS_RE.test(text)) ||
+        textOf(card).match(ADDRESS_RE)?.[0] ||
+        '';
+
+      const asset = normalizeAsset({ symbol, name, description, address });
+      if (asset) candidates.push(asset);
+    }
+
+    // Fallback: start from any visible contract address and climb to the closest
+    // ancestor that also contains a token name. This survives markup/class changes.
+    const addressElements = [...document.querySelectorAll('body *')].filter((el) =>
+      ADDRESS_RE.test(textOf(el))
+    );
+    for (const el of addressElements) {
+      let node = el;
+      while (node && node !== document.body) {
+        const text = textOf(node);
+        if (ADDRESS_RE.test(text) && TOKEN_RE.test(text) && text.length < 3000) {
+          const asset = parseAssetFromText(text);
+          if (asset) candidates.push(asset);
+          break;
+        }
+        node = node.parentElement;
+      }
+    }
+
+    // Last resort: parse windows of nearby visible text around token names/addresses.
+    const bodyLines = linesFrom(document.body?.innerText || '');
+    bodyLines.forEach((line, index) => {
+      if (!ADDRESS_RE.test(line) && !TOKEN_RE.test(line)) return;
+      const windowText = bodyLines.slice(Math.max(0, index - 8), index + 9).join('\n');
+      const asset = parseAssetFromText(windowText);
+      if (asset) candidates.push(asset);
+    });
 
     const seen = new Set();
-    return cards.filter((asset) => {
-      if (seen.has(asset.symbol)) return false;
-      seen.add(asset.symbol);
+    return candidates.filter((asset) => {
+      const key = `${asset.symbol}:${asset.address.toLowerCase()}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
       return true;
     });
   });
@@ -332,6 +418,9 @@ async function scrapeAssets() {
         title: document.title,
         symbolEls: document.querySelectorAll('div.grid.font-mono').length,
         addrEls: document.querySelectorAll('p.font-mono').length,
+        genericAddrMatches: (document.body?.innerText?.match(/0x[a-fA-F0-9]{40}/g) || []).length,
+        tokenMatches: (document.body?.innerText?.match(/\b[A-Z0-9]{2,15}on\b/g) || []).length,
+        buttonLikeEls: document.querySelectorAll('button, [role="button"], a, article, li').length,
         nameEls: document.querySelectorAll('p.truncate.text-sm.font-semibold').length,
         descEls: document.querySelectorAll('p.mt-0\\.5.truncate').length,
         body: document.body?.innerText?.slice(0, 240) || '',
