@@ -48,16 +48,25 @@ const CHINESE_NAMES = {
 //   "NVDAB"  -> Backed Finance (bStocks)
 function getIssuerInfo(tokenName = '') {
   if (/on$/.test(tokenName)) {
-    return { short: 'Ondo', long: 'Ondo Finance', chinese: 'Ondo 代币化' };
+    return { short: 'Ondo', long: 'Ondo Finance', chinese: 'Ondo 代币化', cardTemplate: 'red' };
   }
   if (/B$/.test(tokenName)) {
-    return { short: 'Backed', long: 'Backed Finance', chinese: 'bStocks 代币化' };
+    return { short: 'Backed', long: 'Backed Finance', chinese: 'bStocks 代币化', cardTemplate: 'yellow' };
   }
-  return { short: '未知', long: '未知发行方', chinese: '未知发行方' };
+  return { short: '未知', long: '未知发行方', chinese: '未知发行方', cardTemplate: 'orange' };
 }
 
 function formatChineseTime() {
   return new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false });
+}
+
+function formatAddressForDisplay(address) {
+  return address || '页面未显示';
+}
+
+function formatAssetSummary(asset) {
+  const issuer = getIssuerInfo(asset.name);
+  return `${asset.name} | ${asset.symbol} | ${issuer.long} | ${formatAddressForDisplay(asset.address)}`;
 }
 
 // Try to get Chinese name: first check cache by symbol, then by company name from description
@@ -113,7 +122,7 @@ async function getChineseNameWithFallback(symbol, description) {
 // --- Placeholder stubs, filled in sections below ---
 let browser = null;
 let page = null;
-let knownAssets = new Map(); // symbol -> { name, address }
+let knownAssets = new Map(); // token name -> { symbol, name, description, address, discoveredAt }
 let baselineEstablished = false; // true after first successful scrape has been processed
 let isPolling = false;
 let consecutiveErrors = 0;
@@ -199,7 +208,7 @@ async function sendFeishu(title, content, template = 'red') {
     };
     const res = await axios.post(FEISHU_WEBHOOK_URL, card, { timeout: 10000 });
     if (res.data && res.data.code === 0) {
-      console.log('[FEISHU] Notification sent successfully');
+      console.log(`[FEISHU] Sent notification: ${title}`);
     } else {
       console.error('[FEISHU] Send failed:', JSON.stringify(res.data));
     }
@@ -213,14 +222,14 @@ async function notifyNewStock(stock) {
   const cnName = await getChineseNameWithFallback(stock.symbol, stock.description);
   const issuer = getIssuerInfo(stock.name);
   const content = [
-    `**股票代码：** ${stock.symbol}`,
+    `**资产代码：** ${stock.symbol}`,
     `**中文名称：** ${cnName}`,
     `**Token 名称：** ${stock.name}`,
     `**发行方：** ${issuer.long}（${issuer.chinese}）`,
-    `**合约地址：** ${stock.address || '（页面仅暴露截断地址）'}`,
+    `**合约地址：** ${formatAddressForDisplay(stock.address)}`,
     `**发现时间：** ${formatChineseTime()}`,
   ].join('\n');
-  await sendFeishu(title, content, 'red');
+  await sendFeishu(title, content, issuer.cardTemplate);
 }
 
 async function notifyStartup(assets) {
@@ -229,13 +238,13 @@ async function notifyStartup(assets) {
   for (const a of assets) {
     const cnName = await getChineseNameWithFallback(a.symbol, a.description);
     const issuer = getIssuerInfo(a.name);
-    lines.push(`• ${a.symbol} · ${cnName} · ${a.name}（${issuer.long}）`);
+    lines.push(`• ${a.name} · ${a.symbol} · ${cnName} · ${issuer.long}`);
   }
   const list = lines.join('\n');
   const content = [
     `**轮询间隔：** ${POLL_INTERVAL / 1000} 秒`,
-    `**当前已知股票（共 ${assets.length} 只）：**`,
-    list,
+    `**当前已知资产（共 ${assets.length} 个）：**`,
+    list || '暂无已知资产',
   ].join('\n');
   await sendFeishu(title, content, 'green');
 }
@@ -346,7 +355,7 @@ async function extractAssetsFromPage() {
         lines.find((line) => isStableTokenName(line)) ||
         joined.match(TOKEN_RE)?.[0] ||
         '';
-      const symbolFromToken = isStableTokenName(name) ? name.slice(0, -2) : '';
+      const symbolFromToken = isStableTokenName(name) ? stripStableSuffix(name) : '';
       const symbol =
         lines.find((line) => isSymbol(line) && line !== name && line !== symbolFromToken + 'on') ||
         symbolFromToken;
@@ -354,6 +363,13 @@ async function extractAssetsFromPage() {
         lines.find((line) => /\bTokenized\b/i.test(line)) ||
         lines.find((line) => /\bOndo\b/i.test(line)) ||
         lines.find((line) => /\bbStocks?\b/i.test(line)) ||
+        lines.find((line) =>
+          line !== name &&
+          line !== symbol &&
+          !ANY_ADDRESS_RE.test(line) &&
+          !/asset choices|choose provider|资产选项|資產選項|选择发行方|選擇發行方/i.test(line) &&
+          !/^\d+\s*(个|個)?\s*(asset\s+choices|资产选项|資產選項)$/i.test(line)
+        ) ||
         '';
 
       return normalizeAsset({ symbol, name, description, address });
@@ -509,12 +525,41 @@ async function waitForStableAssets(timeoutMs = SCRAPE_TIMEOUT) {
 // (e.g. ["NVDA", "SPCX", "TSLA"]).
 async function findCollapsedMultiIssuerSymbols() {
   return page.evaluate(() => {
+    const clean = (value = '') =>
+      value
+        .replace(/\u00a0/g, ' ')
+        .replace(/[ \t]+/g, ' ')
+        .trim();
+    const linesFrom = (value = '') =>
+      clean(value)
+        .split(/\n+/)
+        .map((line) => clean(line))
+        .filter(Boolean);
+    const TOKEN_RE = /\b[A-Z0-9]{3,12}(?:on|B)\b/;
+    const ADDRESS_RE = /0x[a-fA-F0-9]{3,40}\.{0,4}[a-fA-F0-9]{0,40}/;
+    const MULTI_ISSUER_HINT_RE =
+      /(Choose\s+provider|asset choices?|选择发行方|選擇發行方|资产选项|資產選項)/i;
+    const isSymbol = (value) => /^[A-Z0-9.]{1,12}$/.test(value);
+    const getCollapsedSymbol = (btn) => {
+      const text = clean(btn.innerText || btn.textContent || '');
+      if (!text || TOKEN_RE.test(text) || ADDRESS_RE.test(text)) return '';
+
+      const lines = linesFrom(text);
+      const hasMultiIssuerHint =
+        MULTI_ISSUER_HINT_RE.test(text) ||
+        lines.some((line) =>
+          /^\d+\s*(个|個)?\s*(asset\s+choices?|资产选项|資產選項)$/i.test(line)
+        );
+      if (!hasMultiIssuerHint) return '';
+
+      const symEl = btn.querySelector('div.font-mono, div.grid.font-mono, [class*="font-mono"]');
+      const symbol = clean(symEl?.textContent || '') || lines.find(isSymbol) || '';
+      return isSymbol(symbol) ? symbol : '';
+    };
+
     const out = [];
     for (const btn of document.querySelectorAll('button')) {
-      const t = (btn.innerText || '').trim();
-      if (!/Choose provider/i.test(t) || !/asset choices/i.test(t)) continue;
-      const symEl = btn.querySelector('div.font-mono, div.grid.font-mono, [class*="font-mono"]');
-      const sym = (symEl?.textContent || '').trim();
+      const sym = getCollapsedSymbol(btn);
       if (sym) out.push(sym);
     }
     return [...new Set(out)];
@@ -527,11 +572,40 @@ async function findCollapsedMultiIssuerSymbols() {
 // clicking the next.
 async function clickMultiIssuerParent(symbol) {
   return page.evaluate((sym) => {
-    for (const btn of document.querySelectorAll('button')) {
-      const t = (btn.innerText || '').trim();
-      if (!/Choose provider/i.test(t) || !/asset choices/i.test(t)) continue;
+    const clean = (value = '') =>
+      value
+        .replace(/\u00a0/g, ' ')
+        .replace(/[ \t]+/g, ' ')
+        .trim();
+    const linesFrom = (value = '') =>
+      clean(value)
+        .split(/\n+/)
+        .map((line) => clean(line))
+        .filter(Boolean);
+    const TOKEN_RE = /\b[A-Z0-9]{3,12}(?:on|B)\b/;
+    const ADDRESS_RE = /0x[a-fA-F0-9]{3,40}\.{0,4}[a-fA-F0-9]{0,40}/;
+    const MULTI_ISSUER_HINT_RE =
+      /(Choose\s+provider|asset choices?|选择发行方|選擇發行方|资产选项|資產選項)/i;
+    const isSymbol = (value) => /^[A-Z0-9.]{1,12}$/.test(value);
+    const getCollapsedSymbol = (btn) => {
+      const text = clean(btn.innerText || btn.textContent || '');
+      if (!text || TOKEN_RE.test(text) || ADDRESS_RE.test(text)) return '';
+
+      const lines = linesFrom(text);
+      const hasMultiIssuerHint =
+        MULTI_ISSUER_HINT_RE.test(text) ||
+        lines.some((line) =>
+          /^\d+\s*(个|個)?\s*(asset\s+choices?|资产选项|資產選項)$/i.test(line)
+        );
+      if (!hasMultiIssuerHint) return '';
+
       const symEl = btn.querySelector('div.font-mono, div.grid.font-mono, [class*="font-mono"]');
-      if ((symEl?.textContent || '').trim() !== sym) continue;
+      const symbol = clean(symEl?.textContent || '') || lines.find(isSymbol) || '';
+      return isSymbol(symbol) ? symbol : '';
+    };
+
+    for (const btn of document.querySelectorAll('button')) {
+      if (getCollapsedSymbol(btn) !== sym) continue;
       btn.click();
       return true;
     }
@@ -582,11 +656,11 @@ async function scrapeAssets() {
       const diagnostics = await page.evaluate(() => {
         const body = document.body?.innerText || '';
         const html = document.documentElement?.outerHTML || '';
-        const hasSupportedHeading = /Supported Assets/i.test(body);
+        const hasSupportedHeading = /(Supported Assets|支持的资产|支持的資產)/i.test(body);
         const hasCreateTokenForm =
-          /\bCreate Token\b/i.test(body) &&
-          /\bToken Name\b/i.test(body) &&
-          /\bToken Symbol\b/i.test(body);
+          /(Create Token|創建稅收代幣|创建税收代币|創建代幣|创建代币)/i.test(body) &&
+          /(Token Name|代幣名稱|代币名称)/i.test(body) &&
+          /(Token Symbol|代幣符號|代币符号)/i.test(body);
         return {
           url: location.href,
           title: document.title,
@@ -658,7 +732,7 @@ async function poll() {
     }
 
     consecutiveErrors = 0;
-    console.log(`[POLL] Found ${assets.length} assets: ${assets.map((a) => a.name).join(', ')}`);
+    console.log(`[POLL] Found ${assets.length} assets: ${assets.map(formatAssetSummary).join('; ')}`);
 
     // If baseline was not established during startup (initial scrape failed),
     // treat the first successful scrape as baseline — not as new assets.
@@ -698,7 +772,7 @@ async function poll() {
     }
 
     if (newAssets.length > 0) {
-      console.log(`[POLL] 🚨 NEW ASSETS DETECTED: ${newAssets.map((a) => a.name).join(', ')}`);
+      console.log(`[POLL] NEW ASSETS DETECTED: ${newAssets.map(formatAssetSummary).join('; ')}`);
       saveState();
 
       // Send notifications for each new asset
@@ -799,7 +873,7 @@ async function main() {
 
     // If new assets were found since last run, also send individual alerts
     if (!isFirstRun && newOnes.length > 0) {
-      console.log(`[MAIN] 🚨 New assets since last run: ${newOnes.map((a) => a.name).join(', ')}`);
+      console.log(`[MAIN] New assets since last run: ${newOnes.map(formatAssetSummary).join('; ')}`);
       for (const stock of newOnes) {
         await notifyNewStock(stock);
       }
@@ -811,4 +885,12 @@ async function main() {
   console.log('[MAIN] Monitor running. Press Ctrl+C to stop.');
 }
 
-main();
+if (require.main === module) {
+  main();
+}
+
+module.exports = {
+  getIssuerInfo,
+  formatAddressForDisplay,
+  formatAssetSummary,
+};

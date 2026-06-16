@@ -1,265 +1,119 @@
 # Flap Vault Monitor
 
-监控 [flap.sh](https://flap.sh) 平台 Vault Factory 中新上线的可分红代币化股票（Ondo Tokenized RWA），发现新资产时通过**飞书机器人 Webhook** 实时推送通知。
+监控 flap.sh Vault Factory 页面中的可分红代币化股票资产。程序定时抓取“支持的资产”列表，发现新的 Token 后记录到本地状态文件，并通过飞书机器人发送通知。
 
-## 功能特性
+## 核心功能
 
-- **自动监控** — 使用 Puppeteer 无头浏览器定时轮询 flap.sh 页面
-- **新股告警** — 发现新上线资产后立即发送飞书卡片消息（含符号、名称、合约地址）
-- **状态持久化** — 已知资产列表保存到 `known_assets.json`，重启后不会重复告警
-- **双重抓取策略** — DOM 选择器 + 正则匹配双保险，提高抓取成功率
-- **自动容错** — 浏览器崩溃自动重启，连续失败时发送异常告警
-- **资源优化** — 拦截图片/字体/样式请求，降低带宽和内存消耗
-- **进程守护** — PM2 管理，支持自动重启、日志管理、开机自启
+- 定时打开 `FLAP_URL`，读取支持的可分红资产列表。
+- 识别单发行方资产和折叠的多发行方资产，例如 `NVDAon` 与 `NVDAB`。
+- 以 Token 名称作为唯一键，避免同一股票不同发行方互相覆盖。
+- 将已知资产保存到 `known_assets.json`，重启后不会重复告警。
+- 连续抓取失败时发送飞书异常通知，并保存 `debug-flap-empty.html` 便于排查。
 
-## 系统要求
-
-- Linux 服务器（Ubuntu 20.04+ / Debian 11+ 推荐）
-- Node.js >= 20.x
-- 至少 512MB 可用内存
-- 飞书群机器人 Webhook URL
-
----
-
-## 安装
-
-### 方式一：一键部署（推荐）
+## 运行方式
 
 ```bash
-# 克隆仓库
-git clone https://github.com/mapalubnb/flap-Vault-monitoring.git
-cd flap-Vault-monitoring
+npm install
+cp .env.example .env
+# 编辑 .env，填入飞书 Webhook
+npm start
+```
 
-# 运行部署脚本（自动安装 Node.js、Chromium 依赖、PM2）
+生产环境建议使用 PM2：
+
+```bash
+npm run pm2:start
+npm run pm2:logs
+npm run pm2:restart
+npm run pm2:stop
+```
+
+也可以在 Linux 服务器上执行部署脚本：
+
+```bash
 chmod +x deploy.sh
 sudo ./deploy.sh
 ```
 
-部署脚本会自动完成以下操作：
-1. 检测并安装 Node.js 20（如未安装或版本过低）
-2. 安装 Puppeteer 所需的 Chromium 系统依赖
-3. 全局安装 PM2 进程管理器
-4. 执行 `npm install` 安装项目依赖
-5. 创建 `logs/` 目录和 `.env` 配置文件
+## 配置说明
 
-### 方式二：手动安装
-
-```bash
-# 1. 克隆仓库
-git clone https://github.com/mapalubnb/flap-Vault-monitoring.git
-cd flap-Vault-monitoring
-
-# 2. 安装 Node.js 20（如已有可跳过）
-curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
-sudo apt-get install -y nodejs
-
-# 3. 安装 Chromium 系统依赖
-sudo apt-get update
-sudo apt-get install -y --no-install-recommends \
-  ca-certificates fonts-liberation libasound2 \
-  libatk-bridge2.0-0 libatk1.0-0 libcups2 libdbus-1-3 \
-  libdrm2 libgbm1 libgtk-3-0 libnspr4 libnss3 \
-  libxcomposite1 libxdamage1 libxrandr2 xdg-utils wget
-
-# 4. 全局安装 PM2
-sudo npm install -g pm2
-
-# 5. 安装项目依赖
-npm install
-
-# 6. 创建日志目录
-mkdir -p logs
-
-# 7. 创建配置文件
-cp .env.example .env
-```
-
-### 配置
-
-编辑 `.env` 文件，填入你的飞书 Webhook 地址：
-
-```bash
-nano .env
-```
+`.env` 支持以下配置：
 
 ```env
-# 飞书 Webhook 地址（必填）
 FEISHU_WEBHOOK_URL=https://open.feishu.cn/open-apis/bot/v2/hook/YOUR_WEBHOOK_KEY
-
-# 监控目标页面（可选，默认已设置）
 FLAP_URL=https://flap.sh/launch?vaultfactory=0x40a9a2fda017e0923ea0b403f2f063f9e51168fb
-
-# 轮询间隔，单位毫秒（可选，默认 1500）
 POLL_INTERVAL=1500
-
-# 页面等待渲染时间，单位毫秒（可选，默认 8000）
 PAGE_WAIT=8000
 ```
 
----
+字段说明：
 
-## 使用
+- `FEISHU_WEBHOOK_URL`：飞书群机器人 Webhook，未配置时只打印日志。
+- `FLAP_URL`：监控目标页面，默认指向当前 Vault Factory。
+- `POLL_INTERVAL`：轮询间隔，单位毫秒。
+- `PAGE_WAIT`：页面渲染等待时间，单位毫秒。
 
-### 前台运行（测试用）
+## 监控逻辑
 
-```bash
-node monitor.js
-```
+程序会读取页面中的资产按钮，并提取统一字段：
 
-### PM2 后台运行（生产环境）
+- `symbol`：底层资产代码，例如 `NVDA`、`SPCX`。
+- `name`：Token 名称，例如 `NVDAon`、`NVDAB`。
+- `description`：页面显示的资产描述，例如 `NVIDIA (Ondo Tokenized)` 或 `NVIDIA Corp`。
+- `address`：页面显示的合约地址。当前 flap.sh 页面通常只暴露截断地址，例如 `0x02Fc...7436`。
 
-```bash
-# 启动
-pm2 start ecosystem.config.js
+当前页面结构包含两类资产：
 
-# 查看状态
-pm2 status
+- 单发行方资产：按钮内直接显示 `symbol / name / description / address`。
+- 多发行方资产：父按钮显示 `选择发行方` 和 `资产选项`，展开后显示多个子资产。程序会逐个展开父按钮并合并子资产，避免漏掉 Backed Finance 或 Ondo Finance 的不同版本。
 
-# 查看实时日志
-pm2 logs flap-vault-monitor
+资产唯一键使用 `name`，不是 `symbol`。因此 `NVDAon` 和 `NVDAB` 会被当作两个独立资产监控。
 
-# 查看最近 100 行日志
-pm2 logs flap-vault-monitor --lines 100
+## 飞书推送规则
 
-# 停止
-pm2 stop flap-vault-monitor
+- 启动通知：绿色卡片，展示本次抓取到的已知资产数量和摘要。
+- 新增资产：按发行方选择卡片颜色。
+- 异常通知：橙色卡片，连续多次抓取不到资产列表时触发。
 
-# 重启
-pm2 restart flap-vault-monitor
-```
+发行方识别规则：
 
-### 开机自启
+| Token 后缀 | 发行方 | 飞书卡片 |
+| --- | --- | --- |
+| `on` | Ondo Finance | 红色 |
+| `B` | Backed Finance | 黄色 |
+| 其他 | 未知发行方 | 橙色 |
 
-```bash
-pm2 save
-pm2 startup
-# 按照终端输出的提示执行 sudo 命令
-```
+新增资产通知字段保持一致：资产代码、中文名称、Token 名称、发行方、合约地址、发现时间。
 
-### npm 脚本
+## 常用维护
 
-```bash
-npm start              # 前台启动
-npm run pm2:start      # PM2 启动
-npm run pm2:stop       # PM2 停止
-npm run pm2:restart    # PM2 重启
-npm run pm2:logs       # 查看日志
-```
-
----
-
-## 更新
-
-```bash
-# 进入项目目录
-cd flap-Vault-monitoring
-
-# 停止当前运行的监控
-pm2 stop flap-vault-monitor
-
-# 拉取最新代码
-git pull origin main
-
-# 更新依赖（如 package.json 有变化）
-npm install
-
-# 重新启动
-pm2 start ecosystem.config.js
-
-# 确认运行状态
-pm2 status
-pm2 logs flap-vault-monitor --lines 20
-```
-
-如果更新涉及系统依赖变更，重新运行部署脚本：
-
-```bash
-sudo ./deploy.sh
-pm2 restart flap-vault-monitor
-```
-
----
-
-## 卸载
-
-### 完整卸载
-
-```bash
-# 1. 停止并删除 PM2 进程
-pm2 stop flap-vault-monitor
-pm2 delete flap-vault-monitor
-pm2 save
-
-# 2. 移除开机自启（如已配置）
-pm2 unstartup systemd
-
-# 3. 删除项目文件
-cd ..
-rm -rf flap-Vault-monitoring
-
-# 4.（可选）卸载全局 PM2
-sudo npm uninstall -g pm2
-
-# 5.（可选）卸载 Node.js
-sudo apt-get remove --purge -y nodejs
-sudo rm -rf /etc/apt/sources.list.d/nodesource.list
-```
-
-### 仅停止监控（保留代码）
-
-```bash
-pm2 stop flap-vault-monitor
-pm2 delete flap-vault-monitor
-pm2 save
-```
-
-### 清除已知资产记录（重新建立基线）
+清除本地基线并重新记录当前页面资产：
 
 ```bash
 rm known_assets.json
-pm2 restart flap-vault-monitor
+npm start
 ```
 
----
+查看 PM2 日志：
+
+```bash
+pm2 logs flap-vault-monitor --lines 100
+```
+
+如果抓取结果为空，先检查 `FLAP_URL` 是否仍能打开目标 Vault Factory 页面，再查看 `debug-flap-empty.html` 中的页面快照。
 
 ## 项目结构
 
-```
+```text
 flap-Vault-monitoring/
 ├── monitor.js             # 核心监控脚本
-├── package.json           # 项目依赖配置
-├── ecosystem.config.js    # PM2 进程管理配置
-├── deploy.sh              # 一键部署脚本
-├── .env.example           # 环境变量模板
-├── .env                   # 环境变量（需手动创建，不纳入版本控制）
-├── .gitignore             # Git 忽略规则
-├── known_assets.json      # 已知资产记录（运行时生成）
-└── logs/                  # 日志目录（运行时生成）
-    ├── out.log
-    └── error.log
+├── package.json           # npm 脚本和依赖
+├── ecosystem.config.js    # PM2 配置
+├── deploy.sh              # Linux 部署脚本
+├── .env.example           # 配置模板
+├── known_assets.json      # 运行时生成的已知资产记录
+└── logs/                  # 运行时日志目录
 ```
-
-## 飞书通知示例
-
-| 通知类型 | 触发条件 |
-|---|---|
-| ✅ 监控已启动 | 程序启动或重启时，展示当前已知资产列表 |
-| 🚨 新增可分红股票 | 发现页面上出现新的代币化资产 |
-| ⚠️ 监控异常 | 连续 10 次抓取失败 |
-
-## 常见问题
-
-**Q: 启动后提示找不到 Chromium？**
-运行 `sudo ./deploy.sh` 安装 Chromium 系统依赖，或手动执行部署脚本中第 2 步的 `apt-get install` 命令。
-
-**Q: 抓取一直返回空结果？**
-尝试增大 `.env` 中的 `PAGE_WAIT` 值（如改为 15000），给 SPA 页面更多渲染时间。也可能是页面结构发生了变化，需要更新 `monitor.js` 中的选择器。
-
-**Q: 如何修改监控的 Vault 地址？**
-编辑 `.env` 文件中的 `FLAP_URL`，替换为目标 Vault Factory 的 URL，然后重启监控。
-
-**Q: 内存占用过高？**
-`ecosystem.config.js` 中已设置 `max_memory_restart: '300M'`，超出后 PM2 会自动重启进程。如需调整，修改该配置值。
 
 ## License
 

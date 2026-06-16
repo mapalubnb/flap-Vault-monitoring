@@ -1,7 +1,7 @@
 {
-  "name": "flap-stock-monitor",
+  "name": "flap-vault-monitor",
   "version": "1.0.0",
-  "description": "Monitor flap.sh for new dividend stocks and notify via Feishu webhook",
+  "description": "Monitor flap.sh Vault Factory for new dividend tokenized assets and notify via Feishu webhook",
   "main": "monitor.js",
   "scripts": {
     "start": "node monitor.js",

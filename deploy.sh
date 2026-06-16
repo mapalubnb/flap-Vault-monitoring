@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-echo "=== Flap Stock Monitor - Deploy Script ==="
+echo "=== Flap Vault Monitor - Deploy Script ==="
 
 # 1. Install Node.js 20 if not present
 if ! command -v node &> /dev/null || [[ $(node -v | cut -d. -f1 | tr -d 'v') -lt 20 ]]; then
@@ -55,6 +55,6 @@ echo "Usage:"
 echo "  1. Edit .env with your Feishu webhook URL"
 echo "  2. Test:   node monitor.js"
 echo "  3. Start:  pm2 start ecosystem.config.js"
-echo "  4. Logs:   pm2 logs flap-monitor"
+echo "  4. Logs:   pm2 logs flap-vault-monitor"
 echo "  5. Auto-start on boot: pm2 save && pm2 startup"
 echo ""
