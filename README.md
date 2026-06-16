@@ -35,6 +35,31 @@ chmod +x deploy.sh
 sudo ./deploy.sh
 ```
 
+## 服务器更新
+
+服务器已有项目并正在用 PM2 运行时，按下面流程更新脚本：
+
+```bash
+cd /path/to/flap-Vault-monitoring
+git pull origin main
+npm install
+pm2 restart flap-vault-monitor || pm2 start ecosystem.config.js
+pm2 logs flap-vault-monitor --lines 100
+```
+
+如果服务器仓库还不是 SSH 远端，可以先执行一次：
+
+```bash
+git remote set-url origin git@github.com:mapalubnb/flap-Vault-monitoring.git
+```
+
+更新说明：
+
+- `.env`、`known_assets.json` 和 `logs/` 不会被 Git 覆盖。
+- `git pull origin main` 拉取最新监控脚本和 README。
+- `npm install` 更新依赖。
+- `pm2 restart flap-vault-monitor` 重启已有进程；如果进程不存在，则用 `ecosystem.config.js` 启动。
+
 ## 配置说明
 
 `.env` 支持以下配置：
