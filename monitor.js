@@ -6,7 +6,7 @@ const path = require('path');
 
 // --- Config ---
 const FEISHU_WEBHOOK_URL = process.env.FEISHU_WEBHOOK_URL;
-const FLAP_URL = process.env.FLAP_URL || 'https://flap.sh/launch?vaultfactory=0x40a9a2fda017e0923ea0b403f2f063f9e51168fb';
+const FLAP_URL = process.env.FLAP_URL || 'https://flap.sh/launch?vaultfactory=0x5418f7e8fF90354DB0eCD48c8b710219244Eb3C5&lang=zh';
 const POLL_INTERVAL = parseInt(process.env.POLL_INTERVAL, 10) || 1500;
 const PAGE_WAIT = parseInt(process.env.PAGE_WAIT, 10) || 8000;
 const SCRAPE_TIMEOUT = Math.max(PAGE_WAIT, 5000);
@@ -50,7 +50,7 @@ function getIssuerInfo(tokenName = '') {
   if (/on$/.test(tokenName)) {
     return { short: 'Ondo', long: 'Ondo Finance', chinese: 'Ondo 代币化', cardTemplate: 'red' };
   }
-  if (/B$/.test(tokenName)) {
+  if (/B$/.test(tokenName) && tokenName.length > 3) {
     return { short: 'Backed', long: 'Backed Finance', chinese: 'bStocks 代币化', cardTemplate: 'yellow' };
   }
   return { short: '未知', long: '未知发行方', chinese: '未知发行方', cardTemplate: 'orange' };
@@ -303,11 +303,10 @@ async function extractAssetsFromPage() {
     const ANY_ADDRESS_RE = new RegExp(
       `(${FULL_ADDRESS_RE.source})|(${TRUNC_ADDRESS_RE.source})`
     );
-    // Stable-token suffix conventions:
+    // Token-name conventions observed on flap.sh:
     //   "AAPLon" -> Ondo Finance tokenized stock
     //   "NVDAB"  -> Backed Finance ("bStocks") tokenized stock
-    // The supported-assets list groups Ondo + Backed variants under the same
-    // underlying symbol (e.g. NVDA -> NVDAon + NVDAB).
+    //   "MUB"    -> plain token name without an issuer suffix
     const TOKEN_RE = /\b[A-Z0-9]{3,12}(?:on|B)\b/;
 
     const clean = (value = '') =>
@@ -322,19 +321,36 @@ async function extractAssetsFromPage() {
         .filter(Boolean);
     const textOf = (el) => clean(el?.innerText || el?.textContent || '');
     const isSymbol = (value) => /^[A-Z0-9.]{1,12}$/.test(value);
-    const isStableTokenName = (value) => /^[A-Z0-9]{3,12}(?:on|B)$/.test(value);
+    const isTokenName = (value) => /^[A-Z0-9]{2,12}(?:on|B)?$/.test(value);
     const stripStableSuffix = (value = '') => {
       if (/on$/.test(value)) return value.slice(0, -2);
-      if (/B$/.test(value)) return value.slice(0, -1);
-      return '';
+      if (/B$/.test(value) && value.length > 3) return value.slice(0, -1);
+      return value;
     };
     const matchAddress = (value = '') => value.match(ANY_ADDRESS_RE)?.[0] || '';
+    const parseTokenDescriptionLine = (line = '') => {
+      const text = clean(line);
+      const suffixed = text.match(/\b[A-Z0-9]{3,12}(?:on|B)\b/);
+      if (suffixed) {
+        return {
+          name: suffixed[0],
+          description: clean(text.slice(suffixed.index + suffixed[0].length).replace(/^[\s·•路-]+/, '').replace(ANY_ADDRESS_RE, '')),
+        };
+      }
+
+      const plain = text.match(/^([A-Z0-9]{2,12})\b/);
+      if (!plain) return null;
+      return {
+        name: plain[1],
+        description: clean(text.slice(plain[1].length).replace(/^[\s·•路-]+/, '').replace(ANY_ADDRESS_RE, '')),
+      };
+    };
 
     function normalizeAsset(asset) {
       const name = clean(asset.name);
       const address = matchAddress(clean(asset.address));
       let symbol = clean(asset.symbol).replace(/[^A-Z0-9.]/g, '');
-      const symbolFromToken = isStableTokenName(name) ? stripStableSuffix(name) : '';
+      const symbolFromToken = isTokenName(name) ? stripStableSuffix(name) : '';
       // The visible symbol pill (e.g. "GOOG") sometimes differs from the token-name
       // root (e.g. "GOOGLon" -> "GOOGL"); the token-name root is the authoritative
       // identifier used in known_assets.json.
@@ -343,7 +359,7 @@ async function extractAssetsFromPage() {
       const description = clean(asset.description) || `${symbol || name} Tokenized`;
 
       // Address may be absent for very transient renders; require name + symbol at minimum.
-      if (!isSymbol(symbol) || !isStableTokenName(name)) return null;
+      if (!isSymbol(symbol) || !isTokenName(name)) return null;
       return { symbol, name, description, address };
     }
 
@@ -351,15 +367,18 @@ async function extractAssetsFromPage() {
       const lines = linesFrom(text);
       const joined = lines.join('\n');
       const address = matchAddress(joined);
+      const tokenDescriptionLine = lines.map(parseTokenDescriptionLine).find(Boolean);
       const name =
-        lines.find((line) => isStableTokenName(line)) ||
+        tokenDescriptionLine?.name ||
+        lines.find((line) => /^[A-Z0-9]{3,12}(?:on|B)$/.test(line)) ||
         joined.match(TOKEN_RE)?.[0] ||
         '';
-      const symbolFromToken = isStableTokenName(name) ? stripStableSuffix(name) : '';
+      const symbolFromToken = isTokenName(name) ? stripStableSuffix(name) : '';
       const symbol =
         lines.find((line) => isSymbol(line) && line !== name && line !== symbolFromToken + 'on') ||
         symbolFromToken;
       const description =
+        tokenDescriptionLine?.description ||
         lines.find((line) => /\bTokenized\b/i.test(line)) ||
         lines.find((line) => /\bOndo\b/i.test(line)) ||
         lines.find((line) => /\bbStocks?\b/i.test(line)) ||
@@ -390,40 +409,63 @@ async function extractAssetsFromPage() {
     //   <span class="shrink-0 text-sm font-semibold text-white">SYMBOLon|SYMBOLB</span>
     //   <span class="min-w-0 truncate font-mono text-xs ...">0xXXXX...YYYY</span>
     //   <span class="mt-2 block truncate text-sm ...">Description</span>
-    const v2Buttons = document.querySelectorAll(
-      'button[aria-pressed], button[role="tab"], button'
-    );
+    const pressedButtons = [...document.querySelectorAll('button[aria-pressed]')];
+    const v2Buttons = pressedButtons.length > 0
+      ? pressedButtons
+      : [...document.querySelectorAll('button[role="tab"], button')];
     for (const btn of v2Buttons) {
       const nameNode = btn.querySelector(
         'span.text-sm.font-semibold, span.truncate.text-sm.font-semibold, p.truncate.text-sm.font-semibold'
       );
       const name = clean(nameNode?.textContent || '');
-      if (!isStableTokenName(name)) continue;
-
-      const symbolNode = btn.querySelector('div.font-mono, div.grid.font-mono, [class*="font-mono"]');
-      // Description selectors cover both single-issuer (mt-0.5 / text-xs) AND
-      // child issuer rows (mt-2 / text-sm). We pick the first matching span
-      // whose text is NOT the token name and NOT an address.
-      const descCandidates = [
+      const tokenDescriptionNodes = [
         ...btn.querySelectorAll(
           'span.mt-0\\.5, span.mt-2, span.truncate.text-xs, span.truncate.text-sm, p.mt-0\\.5.truncate'
         ),
-      ]
+      ];
+      const tokenDescriptionLine =
+        tokenDescriptionNodes
+          .map((el) => parseTokenDescriptionLine(el.textContent || ''))
+          .find(Boolean) ||
+        linesFrom(textOf(btn)).map(parseTokenDescriptionLine).find(Boolean);
+      if (!tokenDescriptionLine) continue;
+
+      const symbolNode = btn.querySelector('div.font-mono, div.grid.font-mono');
+      // Description selectors cover both single-issuer (mt-0.5 / text-xs) AND
+      // child issuer rows (mt-2 / text-sm). We pick the first matching span
+      // whose text is NOT the token name and NOT an address.
+      const descCandidates = tokenDescriptionNodes
         .map((el) => clean(el.textContent || ''))
         .filter((t) => t && t !== name && !ANY_ADDRESS_RE.test(t));
-      const description = descCandidates[0] || '';
+      const description = tokenDescriptionLine?.description || descCandidates[0] || '';
 
       const addressNode = [...btn.querySelectorAll('span.font-mono, p.font-mono, [class*="font-mono"], code')]
         .map((el) => clean(el.textContent || ''))
         .find((t) => ANY_ADDRESS_RE.test(t));
+      const address = addressNode || matchAddress(textOf(btn));
+      if (!address) continue;
+      const tokenName = tokenDescriptionLine.name;
 
       const asset = normalizeAsset({
-        symbol: clean(symbolNode?.textContent || '') || stripStableSuffix(name),
-        name,
+        symbol: clean(symbolNode?.textContent || '') || stripStableSuffix(tokenName),
+        name: tokenName,
         description,
-        address: addressNode || matchAddress(textOf(btn)),
+        address,
       });
       if (asset) candidates.push(asset);
+    }
+
+    // The current flap.sh supported-assets list is fully represented by asset
+    // buttons. If we already have button-level candidates, avoid broader
+    // full-page fallbacks that can accidentally join neighboring asset rows.
+    if (candidates.length > 0) {
+      const byName = new Map();
+      for (const asset of candidates) {
+        const key = asset.name;
+        const prev = byName.get(key);
+        if (!prev || (!prev.address && asset.address)) byName.set(key, asset);
+      }
+      return [...byName.values()];
     }
 
     // ---- Strategy 2: legacy layouts (cards/anchors/articles). ----
@@ -444,7 +486,7 @@ async function extractAssetsFromPage() {
     // ---- Strategy 3: walk up from any element holding a token name. ----
     const tokenNameEls = [...document.querySelectorAll('body *')].filter((el) => {
       const t = textOf(el);
-      return isStableTokenName(t) && t.length < 30;
+      return isTokenName(t) && t.length < 30;
     });
     for (const el of tokenNameEls) {
       let node = el;

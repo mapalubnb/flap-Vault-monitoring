@@ -66,7 +66,7 @@ git remote set-url origin git@github.com:mapalubnb/flap-Vault-monitoring.git
 
 ```env
 FEISHU_WEBHOOK_URL=https://open.feishu.cn/open-apis/bot/v2/hook/YOUR_WEBHOOK_KEY
-FLAP_URL=https://flap.sh/launch?vaultfactory=0x40a9a2fda017e0923ea0b403f2f063f9e51168fb
+FLAP_URL=https://flap.sh/launch?vaultfactory=0x5418f7e8fF90354DB0eCD48c8b710219244Eb3C5&lang=zh
 POLL_INTERVAL=1500
 PAGE_WAIT=8000
 ```
