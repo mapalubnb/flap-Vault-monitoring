@@ -96,6 +96,26 @@ function formatAddressForDisplay(address) {
   return address || '页面未显示';
 }
 
+function hasValidAssetAddress(address = '') {
+  return /^0x[a-fA-F0-9]{40}$/.test(address) ||
+    /^0x[a-fA-F0-9]{3,10}\.{2,4}[a-fA-F0-9]{3,10}$/.test(address);
+}
+
+function filterValidAssets(assets, target = null) {
+  const valid = [];
+  for (const asset of assets || []) {
+    if (asset?.symbol && asset?.name && hasValidAssetAddress(asset.address)) {
+      valid.push(asset);
+    } else {
+      console.warn(
+        `[SCRAPE${target ? `:${target.label}` : ''}] Ignored invalid asset candidate: ` +
+        JSON.stringify(asset)
+      );
+    }
+  }
+  return valid;
+}
+
 function formatAssetSummary(asset, target = null) {
   const issuer = getIssuerInfo(asset.name, target);
   return `${asset.name} | ${asset.symbol} | ${issuer.long} | ${formatAddressForDisplay(asset.address)}`;
@@ -408,8 +428,10 @@ async function extractAssetsFromPage(page) {
 
       const description = clean(asset.description) || `${symbol || name} Tokenized`;
 
-      // Address may be absent for very transient renders; require name + symbol at minimum.
-      if (!isSymbol(symbol) || !isTokenName(name)) return null;
+      // Every real supported-asset button currently exposes a full or truncated
+      // contract address. Requiring it prevents page text such as AI/HOME from
+      // being accepted by the broad legacy fallbacks during transient renders.
+      if (!isSymbol(symbol) || !isTokenName(name) || !address) return null;
       return { symbol, name, description, address };
     }
 
@@ -753,6 +775,8 @@ async function scrapeAssets(target) {
       assets = [...merged.values()];
     }
 
+    assets = filterValidAssets(assets, target);
+
     if (!assets || assets.length === 0) {
       const diagnostics = await page.evaluate(() => {
         const body = document.body?.innerText || '';
@@ -994,6 +1018,8 @@ module.exports = {
   getIssuerInfo,
   formatAddressForDisplay,
   formatAssetSummary,
+  hasValidAssetAddress,
+  filterValidAssets,
   createTarget,
   targetAssetKey,
 };

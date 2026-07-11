@@ -89,6 +89,8 @@ PAGE_WAIT=8000
 - `description`：页面显示的资产描述，例如 `NVIDIA (Ondo Tokenized)` 或 `NVIDIA Corp`。
 - `address`：页面显示的合约地址。当前 flap.sh 页面通常只暴露截断地址，例如 `0x02Fc...7436`。
 
+监控只接受带有完整或截断合约地址的资产。页面导航、标题等普通文本即使包含 `AI`、`HOME` 这类大写词，也不会进入基线或触发新增通知。
+
 Chrome 实测两个目标页面都使用 `button[aria-pressed]` 资产按钮。当前页面结构包含以下资产：
 
 - 单发行方资产：按钮内直接显示 `symbol / name / description / address`。

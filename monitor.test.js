@@ -3,7 +3,9 @@ const assert = require('node:assert/strict');
 
 const {
   createTarget,
+  filterValidAssets,
   getIssuerInfo,
+  hasValidAssetAddress,
   targetAssetKey,
 } = require('./monitor');
 
@@ -16,6 +18,19 @@ test('creates stable and distinct target identities from Vault URLs', () => {
   assert.equal(robinhood.id, 'robinhood:0xabc');
   assert.equal(robinhood.label, 'Robinhood');
   assert.notEqual(targetAssetKey(bsc, 'AAPL'), targetAssetKey(robinhood, 'AAPL'));
+});
+
+test('rejects text-only false positives without contract addresses', () => {
+  const target = createTarget('https://flap.sh/launch?vaultfactory=0xABC', 0);
+  const candidates = [
+    { symbol: 'AI', name: 'AI', description: '人工智能', address: '' },
+    { symbol: 'HOME', name: 'HOME', description: '首页', address: '' },
+    { symbol: 'NVDA', name: 'NVDAon', description: 'NVIDIA', address: '0xA9eE...6F75' },
+  ];
+
+  assert.equal(hasValidAssetAddress(''), false);
+  assert.equal(hasValidAssetAddress('0xA9eE...6F75'), true);
+  assert.deepEqual(filterValidAssets(candidates, target), [candidates[2]]);
 });
 
 test('identifies issuers using both token suffixes and target chain', () => {
