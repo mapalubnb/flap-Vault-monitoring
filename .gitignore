@@ -2,3 +2,4 @@ node_modules/
 logs/
 .env
 known_assets.json
+debug-flap-empty-*.html

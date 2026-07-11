@@ -6,12 +6,41 @@ const path = require('path');
 
 // --- Config ---
 const FEISHU_WEBHOOK_URL = process.env.FEISHU_WEBHOOK_URL;
-const FLAP_URL = process.env.FLAP_URL || 'https://flap.sh/launch?vaultfactory=0x5418f7e8fF90354DB0eCD48c8b710219244Eb3C5&lang=zh';
+const DEFAULT_FLAP_URLS = [
+  'https://flap.sh/launch?vaultfactory=0x5418f7e8fF90354DB0eCD48c8b710219244Eb3C5&lang=zh',
+  'https://flap.sh/launch?vaultfactory=0xe6ca297D1d963b6F00d5b216986123CAeB883AF6&chain=robinhood&lang=zh',
+];
+const FLAP_URLS = (process.env.FLAP_URLS || process.env.FLAP_URL || DEFAULT_FLAP_URLS.join(','))
+  .split(/[\r\n,]+/)
+  .map((url) => url.trim())
+  .filter(Boolean);
 const POLL_INTERVAL = parseInt(process.env.POLL_INTERVAL, 10) || 1500;
 const PAGE_WAIT = parseInt(process.env.PAGE_WAIT, 10) || 8000;
 const SCRAPE_TIMEOUT = Math.max(PAGE_WAIT, 5000);
 const STATE_FILE = path.join(__dirname, 'known_assets.json');
-const DEBUG_SNAPSHOT_FILE = path.join(__dirname, 'debug-flap-empty.html');
+const MAX_CONSECUTIVE_ERRORS = 10;
+
+function createTarget(url, index) {
+  const parsed = new URL(url);
+  const factory = parsed.searchParams.get('vaultfactory') || `target-${index + 1}`;
+  const chain = (parsed.searchParams.get('chain') || 'bsc').toLowerCase();
+  return {
+    id: `${chain}:${factory.toLowerCase()}`,
+    label: chain === 'robinhood' ? 'Robinhood' : chain.toUpperCase(),
+    chain,
+    factory,
+    url,
+    context: null,
+    page: null,
+    baselineEstablished: false,
+    isPolling: false,
+    consecutiveErrors: 0,
+    lastDebugSnapshotAt: 0,
+    debugSnapshotFile: path.join(__dirname, `debug-flap-empty-${chain}-${factory.slice(2, 10)}.html`),
+  };
+}
+
+const targets = FLAP_URLS.map(createTarget);
 
 // --- Chinese name mapping ---
 // Built-in cache for common US stocks (translation APIs can't reliably translate proper nouns)
@@ -46,7 +75,10 @@ const CHINESE_NAMES = {
 // Map flap.sh token-name suffix to issuer information.
 //   "AAPLon" -> Ondo Finance
 //   "NVDAB"  -> Backed Finance (bStocks)
-function getIssuerInfo(tokenName = '') {
+function getIssuerInfo(tokenName = '', target = null) {
+  if (target?.chain === 'robinhood') {
+    return { short: 'Robinhood', long: 'Robinhood', chinese: 'Robinhood Token', cardTemplate: 'blue' };
+  }
   if (/on$/.test(tokenName)) {
     return { short: 'Ondo', long: 'Ondo Finance', chinese: 'Ondo 代币化', cardTemplate: 'red' };
   }
@@ -64,8 +96,8 @@ function formatAddressForDisplay(address) {
   return address || '页面未显示';
 }
 
-function formatAssetSummary(asset) {
-  const issuer = getIssuerInfo(asset.name);
+function formatAssetSummary(asset, target = null) {
+  const issuer = getIssuerInfo(asset.name, target);
   return `${asset.name} | ${asset.symbol} | ${issuer.long} | ${formatAddressForDisplay(asset.address)}`;
 }
 
@@ -121,35 +153,36 @@ async function getChineseNameWithFallback(symbol, description) {
 
 // --- Placeholder stubs, filled in sections below ---
 let browser = null;
-let page = null;
-let knownAssets = new Map(); // token name -> { symbol, name, description, address, discoveredAt }
-let baselineEstablished = false; // true after first successful scrape has been processed
-let isPolling = false;
-let consecutiveErrors = 0;
-let lastDebugSnapshotAt = 0;
-const MAX_CONSECUTIVE_ERRORS = 10;
+let knownAssets = new Map(); // target id + token name -> persisted asset
+
+function targetAssetKey(target, tokenName) {
+  return `${target.id}::${tokenName}`;
+}
 
 // --- State persistence ---
-// `knownAssets` is keyed by token NAME (e.g. "AAPLon", "NVDAB"), not by symbol,
-// so multi-issuer assets like NVDAon + NVDAB are tracked as separate entries.
+// Keys include the target id and token name, so both multi-issuer variants and
+// same-name assets on different Vault Factory pages remain independent.
 function loadState() {
   try {
     if (fs.existsSync(STATE_FILE)) {
       const data = JSON.parse(fs.readFileSync(STATE_FILE, 'utf-8'));
-      // Backward-compat: old format keyed entries by symbol (e.g. "AAPL").
-      // Detect and re-key by name (`entry.name`, e.g. "AAPLon").
+      // Backward-compat: migrate legacy symbol/name keys to the first target.
       const migrated = {};
       let migratedCount = 0;
       for (const [key, value] of Object.entries(data)) {
         if (!value || typeof value !== 'object') continue;
-        const effectiveKey = /^[A-Z0-9]{3,12}(?:on|B)$/.test(value.name) ? value.name : key;
+        const tokenName = value.name || key;
+        const effectiveKey = key.includes('::') ? key : targetAssetKey(targets[0], tokenName);
         if (effectiveKey !== key) migratedCount++;
-        migrated[effectiveKey] = value;
+        migrated[effectiveKey] = {
+          ...value,
+          targetId: value.targetId || targets[0].id,
+        };
       }
       knownAssets = new Map(Object.entries(migrated));
       console.log(`[STATE] Loaded ${knownAssets.size} known assets: ${[...knownAssets.keys()].join(', ')}`);
       if (migratedCount > 0) {
-        console.log(`[STATE] Migrated ${migratedCount} legacy symbol-keyed entries to name-keyed format`);
+        console.log(`[STATE] Migrated ${migratedCount} legacy entries to target-scoped keys`);
         saveState();
       }
     }
@@ -168,7 +201,7 @@ function saveState() {
 }
 
 // --- Feishu notification ---
-async function sendFeishu(title, content, template = 'red') {
+async function sendFeishu(title, content, template = 'red', target = null) {
   if (!FEISHU_WEBHOOK_URL) {
     console.warn('[FEISHU] No webhook URL configured, skipping notification');
     return;
@@ -192,7 +225,7 @@ async function sendFeishu(title, content, template = 'red') {
               {
                 tag: 'button',
                 text: { tag: 'plain_text', content: '打开监控页面' },
-                url: FLAP_URL,
+                url: target?.url || targets[0].url,
                 type: 'primary',
               },
             ],
@@ -217,11 +250,13 @@ async function sendFeishu(title, content, template = 'red') {
   }
 }
 
-async function notifyNewStock(stock) {
+async function notifyNewStock(stock, target) {
   const title = '🚨 新增可分红股票！';
   const cnName = await getChineseNameWithFallback(stock.symbol, stock.description);
-  const issuer = getIssuerInfo(stock.name);
+  const issuer = getIssuerInfo(stock.name, target);
   const content = [
+    `**监控页面：** ${target.label}`,
+    `**Vault Factory：** ${target.factory}`,
     `**资产代码：** ${stock.symbol}`,
     `**中文名称：** ${cnName}`,
     `**Token 名称：** ${stock.name}`,
@@ -229,29 +264,31 @@ async function notifyNewStock(stock) {
     `**合约地址：** ${formatAddressForDisplay(stock.address)}`,
     `**发现时间：** ${formatChineseTime()}`,
   ].join('\n');
-  await sendFeishu(title, content, issuer.cardTemplate);
+  await sendFeishu(title, content, issuer.cardTemplate, target);
 }
 
-async function notifyStartup(assets) {
-  const title = '✅ Flap 监控已启动';
+async function notifyStartup(assets, target) {
+  const title = `✅ Flap ${target.label} 监控已启动`;
   const lines = [];
   for (const a of assets) {
     const cnName = await getChineseNameWithFallback(a.symbol, a.description);
-    const issuer = getIssuerInfo(a.name);
+    const issuer = getIssuerInfo(a.name, target);
     lines.push(`• ${a.name} · ${a.symbol} · ${cnName} · ${issuer.long}`);
   }
   const list = lines.join('\n');
   const content = [
     `**轮询间隔：** ${POLL_INTERVAL / 1000} 秒`,
+    `**Vault Factory：** ${target.factory}`,
     `**当前已知资产（共 ${assets.length} 个）：**`,
     list || '暂无已知资产',
   ].join('\n');
-  await sendFeishu(title, content, 'green');
+  await sendFeishu(title, content, 'green', target);
 }
 
-async function notifyError(msg) {
-  const title = '⚠️ Flap 监控异常';
-  await sendFeishu(title, `**错误信息：** ${msg}`, 'orange');
+async function notifyError(msg, target) {
+  const title = `⚠️ Flap ${target.label} 监控异常`;
+  const content = `**Vault Factory：** ${target.factory}\n**错误信息：** ${msg}`;
+  await sendFeishu(title, content, 'orange', target);
 }
 
 // --- Browser management ---
@@ -265,16 +302,20 @@ async function initBrowser() {
       '--disable-dev-shm-usage',
       '--disable-gpu',
       '--disable-extensions',
-      '--single-process',
     ],
   });
-  page = await browser.newPage();
-  await page.setUserAgent(
+  await Promise.all(targets.map(initTargetPage));
+  console.log('[BROWSER] Ready');
+}
+
+async function initTargetPage(target) {
+  target.context = await browser.createBrowserContext();
+  target.page = await target.context.newPage();
+  await target.page.setUserAgent(
     'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36'
   );
-  // Block images/fonts/media to speed up loading
-  await page.setRequestInterception(true);
-  page.on('request', (req) => {
+  await target.page.setRequestInterception(true);
+  target.page.on('request', (req) => {
     const type = req.resourceType();
     if (['image', 'font', 'media', 'stylesheet'].includes(type)) {
       req.abort();
@@ -282,18 +323,27 @@ async function initBrowser() {
       req.continue();
     }
   });
-  console.log('[BROWSER] Ready');
+}
+
+async function resetTargetPage(target) {
+  await target.context?.close().catch(() => {});
+  target.context = null;
+  target.page = null;
+  await initTargetPage(target);
 }
 
 async function closeBrowser() {
   if (browser) {
     await browser.close().catch(() => {});
     browser = null;
-    page = null;
+    for (const target of targets) {
+      target.context = null;
+      target.page = null;
+    }
   }
 }
 
-async function extractAssetsFromPage() {
+async function extractAssetsFromPage(page) {
   return page.evaluate(() => {
     // Full 40-hex address OR the truncated UI form `0x390a...18c4` (flap.sh v2 layout
     // only renders truncated addresses in the DOM; full addresses are loaded into
@@ -524,7 +574,7 @@ async function extractAssetsFromPage() {
   });
 }
 
-async function waitForStableAssets(timeoutMs = SCRAPE_TIMEOUT) {
+async function waitForStableAssets(page, timeoutMs = SCRAPE_TIMEOUT) {
   // Try to wait until at least one supported-asset row is rendered. This selector
   // matches the current v2 layout (`<span class="block truncate text-sm font-semibold ...">SYMBOLon</span>`
   // or the bStocks variant `SYMBOLB`) but we silently fall back to polling if it
@@ -544,7 +594,16 @@ async function waitForStableAssets(timeoutMs = SCRAPE_TIMEOUT) {
   let lastAssets = [];
 
   while (Date.now() < deadline) {
-    const assets = await extractAssetsFromPage();
+    let assets;
+    try {
+      assets = await extractAssetsFromPage(page);
+    } catch (err) {
+      if (/Execution context was destroyed|detached Frame|Cannot find context/i.test(err.message)) {
+        await new Promise((r) => setTimeout(r, 500));
+        continue;
+      }
+      throw err;
+    }
     const signature = assets.map((a) => `${a.symbol}:${a.name}:${a.address}`).join('|');
 
     if (assets.length > 0 && signature === lastSignature) {
@@ -565,7 +624,7 @@ async function waitForStableAssets(timeoutMs = SCRAPE_TIMEOUT) {
 // --- Page scraping ---
 // Find collapsed "Choose provider" cards and return their visible symbols
 // (e.g. ["NVDA", "SPCX", "TSLA"]).
-async function findCollapsedMultiIssuerSymbols() {
+async function findCollapsedMultiIssuerSymbols(page) {
   return page.evaluate(() => {
     const clean = (value = '') =>
       value
@@ -612,7 +671,7 @@ async function findCollapsedMultiIssuerSymbols() {
 // on success. The page is an accordion: clicking one collapses any other
 // currently-expanded multi-issuer card, so we must scrape children before
 // clicking the next.
-async function clickMultiIssuerParent(symbol) {
+async function clickMultiIssuerParent(page, symbol) {
   return page.evaluate((sym) => {
     const clean = (value = '') =>
       value
@@ -655,15 +714,15 @@ async function clickMultiIssuerParent(symbol) {
   }, symbol);
 }
 
-async function scrapeAssets() {
-  if (!page) {
-    console.warn('[SCRAPE] No browser page available, reinitializing...');
-    await closeBrowser();
-    await initBrowser();
+async function scrapeAssets(target) {
+  if (!target.page) {
+    console.warn(`[SCRAPE:${target.label}] No browser page available, reinitializing...`);
+    await initTargetPage(target);
   }
+  const page = target.page;
   try {
-    await page.goto(FLAP_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
-    let assets = await waitForStableAssets();
+    await page.goto(target.url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    let assets = await waitForStableAssets(page);
 
     // For each collapsed multi-issuer parent (e.g. NVDA / SPCX / TSLA), expand
     // it and merge in any newly-revealed child issuer rows. Expansion is
@@ -671,20 +730,20 @@ async function scrapeAssets() {
     // scrape, then move on.
     let multiSymbols = [];
     try {
-      multiSymbols = await findCollapsedMultiIssuerSymbols();
+      multiSymbols = await findCollapsedMultiIssuerSymbols(page);
     } catch (_) {
       multiSymbols = [];
     }
 
     if (multiSymbols.length > 0) {
-      console.log(`[SCRAPE] Found ${multiSymbols.length} multi-issuer parents: ${multiSymbols.join(', ')}`);
+      console.log(`[SCRAPE:${target.label}] Found ${multiSymbols.length} multi-issuer parents: ${multiSymbols.join(', ')}`);
       const merged = new Map((assets || []).map((a) => [a.name, a]));
       for (const sym of multiSymbols) {
-        const clicked = await clickMultiIssuerParent(sym);
+        const clicked = await clickMultiIssuerParent(page, sym);
         if (!clicked) continue;
         // Give the accordion a moment to render its child rows.
         await new Promise((r) => setTimeout(r, 1200));
-        const expanded = await extractAssetsFromPage();
+        const expanded = await extractAssetsFromPage(page);
         for (const a of expanded) {
           // Prefer entries with an address (later wins only if better).
           const prev = merged.get(a.name);
@@ -721,119 +780,126 @@ async function scrapeAssets() {
           body: body.slice(0, 240),
         };
       });
-      console.warn('[SCRAPE] Empty stable result:', JSON.stringify(diagnostics));
+      console.warn(`[SCRAPE:${target.label}] Empty stable result:`, JSON.stringify(diagnostics));
       if (diagnostics.isStandaloneCreateTokenPage) {
-        console.warn('[SCRAPE] Target URL rendered a Create Token form WITHOUT a Supported Assets section. FLAP_URL may be stale or the vault factory was deprecated by the current flap.sh frontend.');
+        console.warn(`[SCRAPE:${target.label}] Target URL rendered a Create Token form WITHOUT a Supported Assets section. The configured URL may be stale or the vault factory was deprecated by the current flap.sh frontend.`);
       }
-      await saveDebugSnapshot();
+      await saveDebugSnapshot(target);
     }
 
     return assets;
   } catch (err) {
-    console.error('[SCRAPE] Error:', err.message);
+    console.error(`[SCRAPE:${target.label}] Error:`, err.message);
     // If page crashed, reinit browser
-    if (err.message.includes('Target closed') || err.message.includes('Protocol error') || err.message.includes('Session closed')) {
-      console.log('[SCRAPE] Browser seems crashed, reinitializing...');
-      await closeBrowser();
-      await initBrowser();
+    if (/Target closed|Protocol error|Session closed|Execution context was destroyed|detached Frame|Cannot find context/i.test(err.message)) {
+      console.log(`[SCRAPE:${target.label}] Page seems crashed, reinitializing...`);
+      await resetTargetPage(target).catch((resetErr) => {
+        console.error(`[SCRAPE:${target.label}] Page reinitialization failed:`, resetErr.message);
+      });
     }
     return null;
   }
 }
 
-async function saveDebugSnapshot() {
+async function saveDebugSnapshot(target) {
   const now = Date.now();
-  if (now - lastDebugSnapshotAt < 10 * 60 * 1000) return;
-  lastDebugSnapshotAt = now;
+  if (now - target.lastDebugSnapshotAt < 10 * 60 * 1000) return;
+  target.lastDebugSnapshotAt = now;
 
   try {
-    const html = await page.content();
-    fs.writeFileSync(DEBUG_SNAPSHOT_FILE, html);
-    console.warn(`[SCRAPE] Saved debug snapshot to ${DEBUG_SNAPSHOT_FILE}`);
+    const html = await target.page.content();
+    fs.writeFileSync(target.debugSnapshotFile, html);
+    console.warn(`[SCRAPE:${target.label}] Saved debug snapshot to ${target.debugSnapshotFile}`);
   } catch (err) {
     console.warn('[SCRAPE] Failed to save debug snapshot:', err.message);
   }
 }
 
 // --- Core poll loop ---
-async function poll() {
-  if (isPolling) return;
-  isPolling = true;
+function getKnownAssetsForTarget(target) {
+  return [...knownAssets.entries()]
+    .filter(([key, info]) => info.targetId === target.id || key.startsWith(`${target.id}::`))
+    .map(([, info]) => info);
+}
+
+function rememberAsset(target, asset) {
+  knownAssets.set(targetAssetKey(target, asset.name), {
+    symbol: asset.symbol,
+    name: asset.name,
+    description: asset.description,
+    address: asset.address,
+    discoveredAt: new Date().toISOString(),
+    targetId: target.id,
+    chain: target.chain,
+    vaultFactory: target.factory,
+  });
+}
+
+async function poll(target) {
+  if (target.isPolling) return;
+  target.isPolling = true;
 
   try {
-    const assets = await scrapeAssets();
+    const assets = await scrapeAssets(target);
 
     if (!assets || assets.length === 0) {
-      consecutiveErrors++;
-      console.warn(`[POLL] No assets found (error #${consecutiveErrors})`);
-      if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
-        await notifyError(`连续 ${MAX_CONSECUTIVE_ERRORS} 次未能获取资产列表，请检查监控脚本`);
-        consecutiveErrors = 0; // Reset to avoid spamming
+      target.consecutiveErrors++;
+      console.warn(`[POLL:${target.label}] No assets found (error #${target.consecutiveErrors})`);
+      if (target.consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
+        await notifyError(`连续 ${MAX_CONSECUTIVE_ERRORS} 次未能获取资产列表，请检查监控脚本`, target);
+        target.consecutiveErrors = 0;
       }
       return;
     }
 
-    consecutiveErrors = 0;
-    console.log(`[POLL] Found ${assets.length} assets: ${assets.map(formatAssetSummary).join('; ')}`);
+    target.consecutiveErrors = 0;
+    console.log(`[POLL:${target.label}] Found ${assets.length} assets: ${assets.map((a) => formatAssetSummary(a, target)).join('; ')}`);
 
     // If baseline was not established during startup (initial scrape failed),
     // treat the first successful scrape as baseline — not as new assets.
-    if (!baselineEstablished) {
-      console.log('[POLL] Establishing baseline from first successful scrape...');
+    if (!target.baselineEstablished) {
+      console.log(`[POLL:${target.label}] Establishing baseline from first successful scrape...`);
       for (const asset of assets) {
-        if (!knownAssets.has(asset.name)) {
-          knownAssets.set(asset.name, {
-            symbol: asset.symbol,
-            name: asset.name,
-            description: asset.description,
-            address: asset.address,
-            discoveredAt: new Date().toISOString(),
-          });
+        if (!knownAssets.has(targetAssetKey(target, asset.name))) {
+          rememberAsset(target, asset);
         }
       }
       saveState();
-      baselineEstablished = true;
-      // Send startup notification now that we have real data
-      await notifyStartup(assets);
+      target.baselineEstablished = true;
+      await notifyStartup(assets, target);
       return;
     }
 
     // Check for new assets
     const newAssets = [];
     for (const asset of assets) {
-      if (!knownAssets.has(asset.name)) {
+      if (!knownAssets.has(targetAssetKey(target, asset.name))) {
         newAssets.push(asset);
-        knownAssets.set(asset.name, {
-          symbol: asset.symbol,
-          name: asset.name,
-          description: asset.description,
-          address: asset.address,
-          discoveredAt: new Date().toISOString(),
-        });
+        rememberAsset(target, asset);
       }
     }
 
     if (newAssets.length > 0) {
-      console.log(`[POLL] NEW ASSETS DETECTED: ${newAssets.map(formatAssetSummary).join('; ')}`);
+      console.log(`[POLL:${target.label}] NEW ASSETS DETECTED: ${newAssets.map((a) => formatAssetSummary(a, target)).join('; ')}`);
       saveState();
 
       // Send notifications for each new asset
       for (const stock of newAssets) {
-        await notifyNewStock(stock);
+        await notifyNewStock(stock, target);
       }
     }
   } catch (err) {
-    console.error('[POLL] Unexpected error:', err.message);
-    consecutiveErrors++;
+    console.error(`[POLL:${target.label}] Unexpected error:`, err.message);
+    target.consecutiveErrors++;
   } finally {
-    isPolling = false;
+    target.isPolling = false;
   }
 }
 
-function startPolling() {
-  console.log(`[POLL] Starting with interval ${POLL_INTERVAL}ms`);
+function startPolling(target) {
+  console.log(`[POLL:${target.label}] Starting with interval ${POLL_INTERVAL}ms`);
   const loop = async () => {
-    await poll();
+    await poll(target);
     setTimeout(loop, POLL_INTERVAL);
   };
   setTimeout(loop, POLL_INTERVAL);
@@ -850,7 +916,8 @@ process.on('uncaughtException', (err) => {
 // --- Main entry ---
 async function main() {
   console.log('=== Flap Stock Monitor ===');
-  console.log(`URL: ${FLAP_URL}`);
+  console.log(`Targets: ${targets.length}`);
+  for (const target of targets) console.log(`- ${target.label}: ${target.url}`);
   console.log(`Poll interval: ${POLL_INTERVAL}ms`);
   console.log(`Feishu webhook: ${FEISHU_WEBHOOK_URL ? 'configured' : '⚠️ NOT configured'}`);
 
@@ -869,62 +936,54 @@ async function main() {
   // Init browser
   await initBrowser();
 
-  // First scrape to establish baseline (retry up to 3 times)
-  console.log('[MAIN] Performing initial scrape...');
+  await Promise.all(targets.map(initializeTarget));
+
+  for (const target of targets) startPolling(target);
+  console.log('[MAIN] All monitors running. Press Ctrl+C to stop.');
+}
+
+async function initializeTarget(target) {
+  console.log(`[MAIN:${target.label}] Performing initial scrape...`);
   let initialAssets = null;
   for (let attempt = 1; attempt <= 3; attempt++) {
-    initialAssets = await scrapeAssets();
+    initialAssets = await scrapeAssets(target);
     if (initialAssets && initialAssets.length > 0) break;
-    console.warn(`[MAIN] Initial scrape attempt ${attempt}/3 returned no assets, retrying...`);
+    console.warn(`[MAIN:${target.label}] Initial scrape attempt ${attempt}/3 returned no assets, retrying...`);
     await new Promise((r) => setTimeout(r, PAGE_WAIT));
   }
 
   if (!initialAssets || initialAssets.length === 0) {
-    console.error('[MAIN] All initial scrape attempts failed. Will establish baseline on first successful poll.');
-    // Send startup notification with previously known assets from state file
-    const knownList = [...knownAssets.entries()].map(([name, info]) => ({
-      symbol: info.symbol || name.replace(/(on|B)$/, ''),
-      name,
+    console.error(`[MAIN:${target.label}] All initial scrape attempts failed. Will establish baseline on first successful poll.`);
+    const knownList = getKnownAssetsForTarget(target).map((info) => ({
+      symbol: info.symbol || info.name.replace(/(on|B)$/, ''),
+      name: info.name,
       description: info.description || '',
     }));
-    await notifyStartup(knownList);
-    // baselineEstablished stays false — poll() will handle it
+    await notifyStartup(knownList, target);
   } else {
-    const isFirstRun = knownAssets.size === 0;
+    const isFirstRun = getKnownAssetsForTarget(target).length === 0;
     const newOnes = [];
 
     for (const asset of initialAssets) {
-      if (!knownAssets.has(asset.name)) {
+      if (!knownAssets.has(targetAssetKey(target, asset.name))) {
         newOnes.push(asset);
-        knownAssets.set(asset.name, {
-          symbol: asset.symbol,
-          name: asset.name,
-          description: asset.description,
-          address: asset.address,
-          discoveredAt: new Date().toISOString(),
-        });
+        rememberAsset(target, asset);
       }
     }
     saveState();
-    baselineEstablished = true;
+    target.baselineEstablished = true;
 
-    console.log(`[MAIN] Baseline: ${knownAssets.size} assets known`);
+    console.log(`[MAIN:${target.label}] Baseline: ${getKnownAssetsForTarget(target).length} assets known`);
 
-    // Always send startup notification on every restart
-    await notifyStartup(initialAssets);
+    await notifyStartup(initialAssets, target);
 
-    // If new assets were found since last run, also send individual alerts
     if (!isFirstRun && newOnes.length > 0) {
-      console.log(`[MAIN] New assets since last run: ${newOnes.map(formatAssetSummary).join('; ')}`);
+      console.log(`[MAIN:${target.label}] New assets since last run: ${newOnes.map((a) => formatAssetSummary(a, target)).join('; ')}`);
       for (const stock of newOnes) {
-        await notifyNewStock(stock);
+        await notifyNewStock(stock, target);
       }
     }
   }
-
-  // Start poll loop
-  startPolling();
-  console.log('[MAIN] Monitor running. Press Ctrl+C to stop.');
 }
 
 if (require.main === module) {
@@ -935,4 +994,6 @@ module.exports = {
   getIssuerInfo,
   formatAddressForDisplay,
   formatAssetSummary,
+  createTarget,
+  targetAssetKey,
 };
