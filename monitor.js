@@ -45,11 +45,64 @@ function createTarget(url, index) {
     rpcProbes: [],
     pendingRpcProbes: new Map(),
     capturingRpcProbes: false,
+    lastPollMode: 'unknown',
+    pollingStats: createPollingStats(),
     debugSnapshotFile: path.join(__dirname, `debug-flap-empty-${chain}-${factory.slice(2, 10)}.html`),
   };
 }
 
 const targets = FLAP_URLS.map(createTarget);
+
+function createPollingStats(now = Date.now()) {
+  return {
+    windowStartedAt: now,
+    lastPollStartedAt: 0,
+    completed: 0,
+    failures: 0,
+    rpcPolls: 0,
+    pagePolls: 0,
+    intervalSamples: 0,
+    totalStartInterval: 0,
+    totalDuration: 0,
+  };
+}
+
+function recordPollStart(stats, now = Date.now()) {
+  if (stats.lastPollStartedAt > 0) {
+    stats.totalStartInterval += now - stats.lastPollStartedAt;
+    stats.intervalSamples++;
+  }
+  stats.lastPollStartedAt = now;
+}
+
+function recordPollEnd(stats, startedAt, mode, succeeded, now = Date.now()) {
+  stats.completed++;
+  stats.totalDuration += now - startedAt;
+  if (!succeeded) stats.failures++;
+  if (mode === 'rpc') stats.rpcPolls++;
+  if (mode === 'page') stats.pagePolls++;
+}
+
+function summarizePollingStats(stats, now = Date.now()) {
+  return {
+    windowMs: now - stats.windowStartedAt,
+    completed: stats.completed,
+    failures: stats.failures,
+    rpcPolls: stats.rpcPolls,
+    pagePolls: stats.pagePolls,
+    averageStartIntervalMs: stats.intervalSamples > 0
+      ? Math.round(stats.totalStartInterval / stats.intervalSamples)
+      : 0,
+    averageDurationMs: stats.completed > 0
+      ? Math.round(stats.totalDuration / stats.completed)
+      : 0,
+  };
+}
+
+function resetPollingStatsWindow(stats, now = Date.now()) {
+  const lastPollStartedAt = stats.lastPollStartedAt;
+  Object.assign(stats, createPollingStats(now), { lastPollStartedAt });
+}
 
 // --- Chinese name mapping ---
 // Built-in cache for common US stocks (translation APIs can't reliably translate proper nouns)
@@ -925,6 +978,7 @@ function getPollingInitialDelay(index, count, interval = POLL_INTERVAL) {
 async function getAssetsForPoll(target) {
   const fullRefreshDue = Date.now() - target.lastFullScrapeAt >= FULL_REFRESH_INTERVAL;
   if (!target.lastAssets.length || !target.rpcProbes.length || fullRefreshDue) {
+    target.lastPollMode = 'page';
     if (fullRefreshDue && target.lastFullScrapeAt > 0) {
       console.log(`[POLL:${target.label}] Running periodic full-page verification`);
     }
@@ -933,12 +987,16 @@ async function getAssetsForPoll(target) {
 
   try {
     const changed = await haveRpcProbesChanged(target);
-    if (!changed) return target.lastAssets;
+    if (!changed) {
+      target.lastPollMode = 'rpc';
+      return target.lastAssets;
+    }
     console.log(`[POLL:${target.label}] On-chain asset configuration changed, refreshing page`);
   } catch (err) {
     console.warn(`[POLL:${target.label}] Lightweight RPC probe failed, falling back to page scrape: ${err.message}`);
   }
 
+  target.lastPollMode = 'page';
   return scrapeAssets(target);
 }
 
@@ -952,9 +1010,27 @@ function logPollResult(target, assets) {
   console.log(`[POLL:${target.label}] Found ${assets.length} assets: ${assets.map((a) => formatAssetSummary(a, target)).join('; ')}`);
 }
 
+function logPollingStats(target, now = Date.now()) {
+  const stats = target.pollingStats;
+  if (now - stats.windowStartedAt < HEARTBEAT_INTERVAL) return;
+
+  const summary = summarizePollingStats(stats, now);
+  console.log(
+    `[STATS:${target.label}] Window ${(summary.windowMs / 1000).toFixed(1)}s | ` +
+    `completed ${summary.completed} | avg interval ${summary.averageStartIntervalMs}ms | ` +
+    `avg duration ${summary.averageDurationMs}ms | RPC ${summary.rpcPolls} | ` +
+    `page ${summary.pagePolls} | failures ${summary.failures}`
+  );
+  resetPollingStatsWindow(stats, now);
+}
+
 async function poll(target) {
   if (target.isPolling) return;
   target.isPolling = true;
+  const startedAt = Date.now();
+  let succeeded = false;
+  target.lastPollMode = 'unknown';
+  recordPollStart(target.pollingStats, startedAt);
 
   try {
     const assets = await getAssetsForPoll(target);
@@ -970,6 +1046,7 @@ async function poll(target) {
     }
 
     target.consecutiveErrors = 0;
+    succeeded = true;
     logPollResult(target, assets);
 
     // If baseline was not established during startup (initial scrape failed),
@@ -1009,11 +1086,15 @@ async function poll(target) {
     console.error(`[POLL:${target.label}] Unexpected error:`, err.message);
     target.consecutiveErrors++;
   } finally {
+    const finishedAt = Date.now();
+    recordPollEnd(target.pollingStats, startedAt, target.lastPollMode, succeeded, finishedAt);
+    logPollingStats(target, finishedAt);
     target.isPolling = false;
   }
 }
 
 function startPolling(target, initialDelay = POLL_INTERVAL) {
+  target.pollingStats = createPollingStats();
   console.log(`[POLL:${target.label}] Starting with interval ${POLL_INTERVAL}ms, initial delay ${initialDelay}ms`);
   const loop = async () => {
     await poll(target);
@@ -1117,6 +1198,10 @@ module.exports = {
   filterValidAssets,
   getPollingInitialDelay,
   hasRpcResultChanged,
+  createPollingStats,
+  recordPollStart,
+  recordPollEnd,
+  summarizePollingStats,
   createTarget,
   targetAssetKey,
 };

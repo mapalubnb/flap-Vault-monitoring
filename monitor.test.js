@@ -3,11 +3,15 @@ const assert = require('node:assert/strict');
 
 const {
   createTarget,
+  createPollingStats,
   filterValidAssets,
   getPollingInitialDelay,
   getIssuerInfo,
   hasValidAssetAddress,
   hasRpcResultChanged,
+  recordPollEnd,
+  recordPollStart,
+  summarizePollingStats,
   targetAssetKey,
 } = require('./monitor');
 
@@ -50,4 +54,22 @@ test('detects RPC changes without altering the configured polling interval', () 
   assert.equal(hasRpcResultChanged(probe, { result: '0x5678' }), true);
   assert.equal(getPollingInitialDelay(0, 2, 1200), 1200);
   assert.equal(getPollingInitialDelay(1, 2, 1200), 1800);
+});
+
+test('summarizes polling cadence with constant-memory counters', () => {
+  const stats = createPollingStats(1000);
+  recordPollStart(stats, 2000);
+  recordPollEnd(stats, 2000, 'rpc', true, 2100);
+  recordPollStart(stats, 3300);
+  recordPollEnd(stats, 3300, 'page', false, 3500);
+
+  assert.deepEqual(summarizePollingStats(stats, 4000), {
+    windowMs: 3000,
+    completed: 2,
+    failures: 1,
+    rpcPolls: 1,
+    pagePolls: 1,
+    averageStartIntervalMs: 1300,
+    averageDurationMs: 150,
+  });
 });
