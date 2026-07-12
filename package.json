@@ -1,6 +1,6 @@
 {
   "name": "flap-vault-monitor",
-  "version": "1.2.2",
+  "version": "1.3.0",
   "description": "Monitor multiple flap.sh Vault Factory pages for new dividend tokenized assets and notify via Feishu webhook",
   "main": "monitor.js",
   "scripts": {
@@ -12,8 +12,9 @@
     "pm2:logs": "pm2 logs flap-vault-monitor"
   },
   "dependencies": {
-    "puppeteer": "^23.0.0",
+    "axios": "^1.7.0",
     "dotenv": "^16.4.0",
-    "axios": "^1.7.0"
+    "puppeteer": "^23.0.0",
+    "viem": "^2.55.1"
   }
 }

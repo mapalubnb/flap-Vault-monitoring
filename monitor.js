@@ -1,8 +1,15 @@
 require('dotenv').config();
 const puppeteer = require('puppeteer');
 const axios = require('axios');
+const { decodeFunctionResult, encodeFunctionData, getAddress } = require('viem');
 const fs = require('fs');
 const path = require('path');
+
+function parseNonNegativeInt(value, fallback) {
+  if (value == null || value === '') return fallback;
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+}
 
 // --- Config ---
 const FEISHU_WEBHOOK_URL = process.env.FEISHU_WEBHOOK_URL;
@@ -17,10 +24,36 @@ const FLAP_URLS = (process.env.FLAP_URLS || process.env.FLAP_URL || DEFAULT_FLAP
 const POLL_INTERVAL = parseInt(process.env.POLL_INTERVAL, 10) || 1500;
 const PAGE_WAIT = parseInt(process.env.PAGE_WAIT, 10) || 8000;
 const SCRAPE_TIMEOUT = Math.max(PAGE_WAIT, 5000);
-const FULL_REFRESH_INTERVAL = parseInt(process.env.FULL_REFRESH_INTERVAL, 10) || 30 * 60 * 1000;
 const HEARTBEAT_INTERVAL = parseInt(process.env.HEARTBEAT_INTERVAL, 10) || 60 * 1000;
+const BROWSER_FALLBACK_ENABLED = process.env.BROWSER_FALLBACK_ENABLED !== 'false';
+const BROWSER_FALLBACK_COOLDOWN = parseNonNegativeInt(process.env.BROWSER_FALLBACK_COOLDOWN, 60 * 1000);
+const BROWSER_VALIDATION_INTERVAL = parseNonNegativeInt(
+  process.env.BROWSER_VALIDATION_INTERVAL,
+  6 * 60 * 60 * 1000
+);
+const BSC_RPC_URL = process.env.BSC_RPC_URL || 'https://bsc-dataseed.bnbchain.org/';
+const ROBINHOOD_RPC_URL = process.env.ROBINHOOD_RPC_URL || 'https://rpc.mainnet.chain.robinhood.com/';
 const STATE_FILE = path.join(__dirname, 'known_assets.json');
 const MAX_CONSECUTIVE_ERRORS = 10;
+let rpcRequestId = 0;
+
+const FACTORY_ABI = [{
+  type: 'function',
+  name: 'getSupportedAssetsWithNames',
+  stateMutability: 'view',
+  inputs: [],
+  outputs: [
+    { name: 'assets', type: 'address[]' },
+    { name: 'names', type: 'string[]' },
+  ],
+}];
+const ERC20_SYMBOL_ABI = [{
+  type: 'function',
+  name: 'symbol',
+  stateMutability: 'view',
+  inputs: [],
+  outputs: [{ name: '', type: 'string' }],
+}];
 
 function createTarget(url, index) {
   const parsed = new URL(url);
@@ -30,6 +63,7 @@ function createTarget(url, index) {
     id: `${chain}:${factory.toLowerCase()}`,
     label: chain === 'robinhood' ? 'Robinhood' : chain.toUpperCase(),
     chain,
+    rpcUrl: chain === 'robinhood' ? ROBINHOOD_RPC_URL : BSC_RPC_URL,
     factory,
     url,
     context: null,
@@ -38,13 +72,15 @@ function createTarget(url, index) {
     isPolling: false,
     consecutiveErrors: 0,
     lastDebugSnapshotAt: 0,
-    lastFullScrapeAt: 0,
+    lastBrowserValidationAt: Date.now(),
+    lastBrowserFallbackAt: 0,
+    lastChainErrorLogAt: 0,
+    lastFallbackSkipLogAt: 0,
+    lastPollErrorLogAt: 0,
     lastHeartbeatAt: 0,
     lastLoggedSignature: '',
     lastAssets: [],
-    rpcProbes: [],
-    pendingRpcProbes: new Map(),
-    capturingRpcProbes: false,
+    symbolCache: new Map(),
     lastPollMode: 'unknown',
     pollingStats: createPollingStats(),
     debugSnapshotFile: path.join(__dirname, `debug-flap-empty-${chain}-${factory.slice(2, 10)}.html`),
@@ -59,8 +95,8 @@ function createPollingStats(now = Date.now()) {
     lastPollStartedAt: 0,
     completed: 0,
     failures: 0,
-    rpcPolls: 0,
-    pagePolls: 0,
+    chainPolls: 0,
+    browserPolls: 0,
     intervalSamples: 0,
     totalStartInterval: 0,
     totalDuration: 0,
@@ -79,8 +115,8 @@ function recordPollEnd(stats, startedAt, mode, succeeded, now = Date.now()) {
   stats.completed++;
   stats.totalDuration += now - startedAt;
   if (!succeeded) stats.failures++;
-  if (mode === 'rpc') stats.rpcPolls++;
-  if (mode === 'page') stats.pagePolls++;
+  if (mode === 'chain') stats.chainPolls++;
+  if (mode === 'browser') stats.browserPolls++;
 }
 
 function summarizePollingStats(stats, now = Date.now()) {
@@ -88,8 +124,8 @@ function summarizePollingStats(stats, now = Date.now()) {
     windowMs: now - stats.windowStartedAt,
     completed: stats.completed,
     failures: stats.failures,
-    rpcPolls: stats.rpcPolls,
-    pagePolls: stats.pagePolls,
+    chainPolls: stats.chainPolls,
+    browserPolls: stats.browserPolls,
     averageStartIntervalMs: stats.intervalSamples > 0
       ? Math.round(stats.totalStartInterval / stats.intervalSamples)
       : 0,
@@ -235,6 +271,8 @@ async function getChineseNameWithFallback(symbol, description) {
 
 // --- Placeholder stubs, filled in sections below ---
 let browser = null;
+let browserLaunchPromise = null;
+let activeBrowserTasks = 0;
 let knownAssets = new Map(); // target id + token name -> persisted asset
 
 function targetAssetKey(target, tokenName) {
@@ -374,23 +412,31 @@ async function notifyError(msg, target) {
 }
 
 // --- Browser management ---
-async function initBrowser() {
-  console.log('[BROWSER] Launching...');
-  browser = await puppeteer.launch({
-    headless: 'new',
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-gpu',
-      '--disable-extensions',
-    ],
-  });
-  await Promise.all(targets.map(initTargetPage));
-  console.log('[BROWSER] Ready');
+async function ensureBrowser() {
+  if (browser) return;
+  if (!browserLaunchPromise) {
+    console.log('[BROWSER] Launching...');
+    browserLaunchPromise = puppeteer.launch({
+      headless: 'new',
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        '--disable-extensions',
+      ],
+    }).then((launchedBrowser) => {
+      browser = launchedBrowser;
+      console.log('[BROWSER] Ready');
+    }).finally(() => {
+      browserLaunchPromise = null;
+    });
+  }
+  await browserLaunchPromise;
 }
 
 async function initTargetPage(target) {
+  await ensureBrowser();
   target.context = await browser.createBrowserContext();
   target.page = await target.context.newPage();
   await target.page.setUserAgent(
@@ -405,31 +451,6 @@ async function initTargetPage(target) {
       req.continue();
     }
   });
-  target.page.on('response', (response) => captureRpcProbe(target, response));
-}
-
-async function captureRpcProbe(target, response) {
-  if (!target.capturingRpcProbes) return;
-  const request = response.request();
-  if (request.method() !== 'POST' || !['fetch', 'xhr'].includes(request.resourceType())) return;
-
-  try {
-    const payload = JSON.parse(request.postData() || '');
-    const factoryNeedle = target.factory.toLowerCase().replace(/^0x/, '');
-    if (payload.method !== 'eth_call' || !JSON.stringify(payload.params).toLowerCase().includes(factoryNeedle)) return;
-
-    const data = await response.json();
-    if (!data || data.error || data.result == null) return;
-    const key = `${request.url()}::${JSON.stringify(payload.params)}`;
-    target.pendingRpcProbes.set(key, {
-      key,
-      url: request.url(),
-      payload,
-      signature: JSON.stringify(data.result),
-    });
-  } catch (_) {
-    // Non-JSON and interrupted responses are not suitable as lightweight probes.
-  }
 }
 
 async function closeTargetPage(target) {
@@ -446,6 +467,7 @@ async function closeBrowser() {
       target.context = null;
       target.page = null;
     }
+    console.log('[BROWSER] Closed');
   }
 }
 
@@ -824,8 +846,6 @@ async function scrapeAssets(target) {
   }
   const page = target.page;
   try {
-    target.pendingRpcProbes = new Map();
-    target.capturingRpcProbes = true;
     await page.goto(target.url, { waitUntil: 'domcontentloaded', timeout: 30000 });
     let assets = await waitForStableAssets(page);
 
@@ -859,11 +879,6 @@ async function scrapeAssets(target) {
     }
 
     assets = filterValidAssets(assets, target);
-    target.capturingRpcProbes = false;
-    if (target.pendingRpcProbes.size > 0) {
-      target.rpcProbes = [...target.pendingRpcProbes.values()];
-      console.log(`[SCRAPE:${target.label}] Captured ${target.rpcProbes.length} lightweight RPC probes`);
-    }
 
     if (!assets || assets.length === 0) {
       const diagnostics = await page.evaluate(() => {
@@ -899,13 +914,11 @@ async function scrapeAssets(target) {
       await saveDebugSnapshot(target);
     } else {
       target.lastAssets = assets;
-      target.lastFullScrapeAt = Date.now();
     }
 
     await closeTargetPage(target);
     return assets;
   } catch (err) {
-    target.capturingRpcProbes = false;
     console.error(`[SCRAPE:${target.label}] Error:`, err.message);
     // If page crashed, reinit browser
     if (/Target closed|Protocol error|Session closed|Execution context was destroyed|detached Frame|Cannot find context/i.test(err.message)) {
@@ -950,54 +963,171 @@ function rememberAsset(target, asset) {
   });
 }
 
-async function haveRpcProbesChanged(target) {
-  if (target.rpcProbes.length === 0) return true;
-
-  const results = await Promise.all(target.rpcProbes.map(async (probe) => {
-    const response = await axios.post(probe.url, probe.payload, {
-      timeout: 5000,
-      headers: { 'content-type': 'application/json' },
-    });
-    if (response.data?.error || response.data?.result == null) {
-      throw new Error(response.data?.error?.message || 'RPC returned no result');
-    }
-    return hasRpcResultChanged(probe, response.data);
-  }));
-
-  return results.some(Boolean);
-}
-
-function hasRpcResultChanged(probe, responseData) {
-  return JSON.stringify(responseData?.result) !== probe.signature;
-}
-
 function getPollingInitialDelay(index, count, interval = POLL_INTERVAL) {
   return interval + Math.floor((interval * index) / Math.max(count, 1));
 }
 
-async function getAssetsForPoll(target) {
-  const fullRefreshDue = Date.now() - target.lastFullScrapeAt >= FULL_REFRESH_INTERVAL;
-  if (!target.lastAssets.length || !target.rpcProbes.length || fullRefreshDue) {
-    target.lastPollMode = 'page';
-    if (fullRefreshDue && target.lastFullScrapeAt > 0) {
-      console.log(`[POLL:${target.label}] Running periodic full-page verification`);
+function getUnderlyingSymbol(tokenName = '') {
+  if (/on$/.test(tokenName)) return tokenName.slice(0, -2);
+  if (/B$/.test(tokenName) && tokenName.length > 3) return tokenName.slice(0, -1);
+  return tokenName;
+}
+
+async function rpcEthCall(target, to, data) {
+  const response = await axios.post(target.rpcUrl, {
+    jsonrpc: '2.0',
+    id: ++rpcRequestId,
+    method: 'eth_call',
+    params: [{ to, data }, 'latest'],
+  }, {
+    timeout: 5000,
+    headers: { 'content-type': 'application/json' },
+  });
+
+  if (response.data?.error || response.data?.result == null) {
+    throw new Error(response.data?.error?.message || 'RPC returned no result');
+  }
+  return response.data.result;
+}
+
+function decodeFactoryAssetsResult(data) {
+  const [addresses, names] = decodeFunctionResult({
+    abi: FACTORY_ABI,
+    functionName: 'getSupportedAssetsWithNames',
+    data,
+  });
+  if (!Array.isArray(addresses) || !Array.isArray(names) || addresses.length !== names.length) {
+    throw new Error('Factory returned mismatched assets and names');
+  }
+  return addresses.map((address, index) => ({
+    address: getAddress(address),
+    description: String(names[index] || '').trim(),
+  }));
+}
+
+function decodeSymbolResult(data) {
+  const symbol = decodeFunctionResult({
+    abi: ERC20_SYMBOL_ABI,
+    functionName: 'symbol',
+    data,
+  });
+  return String(symbol || '').trim();
+}
+
+function validateChainAssets(assets) {
+  if (!Array.isArray(assets) || assets.length < 1 || assets.length > 100) {
+    throw new Error(`Invalid chain asset count: ${assets?.length ?? 0}`);
+  }
+  const addresses = new Set();
+  for (const asset of assets) {
+    if (!/^0x[a-fA-F0-9]{40}$/.test(asset.address) || !asset.name || !asset.symbol || !asset.description) {
+      throw new Error(`Invalid chain asset: ${JSON.stringify(asset)}`);
     }
-    return scrapeAssets(target);
+    const address = asset.address.toLowerCase();
+    if (addresses.has(address)) throw new Error(`Duplicate chain asset address: ${asset.address}`);
+    addresses.add(address);
+  }
+  return assets;
+}
+
+async function fetchAssetsFromChain(target) {
+  const factoryData = encodeFunctionData({
+    abi: FACTORY_ABI,
+    functionName: 'getSupportedAssetsWithNames',
+  });
+  const factoryResult = await rpcEthCall(target, target.factory, factoryData);
+  const entries = decodeFactoryAssetsResult(factoryResult);
+  const symbolData = encodeFunctionData({ abi: ERC20_SYMBOL_ABI, functionName: 'symbol' });
+
+  await Promise.all(entries.map(async (entry) => {
+    const key = entry.address.toLowerCase();
+    if (target.symbolCache.has(key)) return;
+    const result = await rpcEthCall(target, entry.address, symbolData);
+    const symbol = decodeSymbolResult(result);
+    if (!symbol) throw new Error(`Token symbol is empty: ${entry.address}`);
+    target.symbolCache.set(key, symbol);
+  }));
+
+  const assets = entries.map((entry) => {
+    const name = target.symbolCache.get(entry.address.toLowerCase());
+    return {
+      symbol: getUnderlyingSymbol(name),
+      name,
+      description: entry.description,
+      address: entry.address,
+    };
+  });
+  return validateChainAssets(assets);
+}
+
+function canUseBrowserFallback(target, now = Date.now(), force = false) {
+  return BROWSER_FALLBACK_ENABLED && (
+    force || now - target.lastBrowserFallbackAt >= BROWSER_FALLBACK_COOLDOWN
+  );
+}
+
+async function runBrowserScrape(target, reason, force = false) {
+  const now = Date.now();
+  if (!canUseBrowserFallback(target, now, force)) {
+    if (shouldLogThrottled(target, 'lastFallbackSkipLogAt', now)) {
+      console.warn(`[FALLBACK:${target.label}] Browser fallback skipped (disabled or cooling down)`);
+    }
+    return null;
   }
 
+  target.lastBrowserFallbackAt = now;
+  target.lastPollMode = 'browser';
+  activeBrowserTasks++;
+  console.warn(`[FALLBACK:${target.label}] ${reason}; starting browser fallback`);
   try {
-    const changed = await haveRpcProbesChanged(target);
-    if (!changed) {
-      target.lastPollMode = 'rpc';
-      return target.lastAssets;
+    const assets = await scrapeAssets(target);
+    if (assets?.length) {
+      console.log(`[FALLBACK:${target.label}] Browser scrape succeeded with ${assets.length} assets`);
     }
-    console.log(`[POLL:${target.label}] On-chain asset configuration changed, refreshing page`);
-  } catch (err) {
-    console.warn(`[POLL:${target.label}] Lightweight RPC probe failed, falling back to page scrape: ${err.message}`);
+    return assets;
+  } finally {
+    activeBrowserTasks--;
+    if (activeBrowserTasks === 0) await closeBrowser();
   }
+}
 
-  target.lastPollMode = 'page';
-  return scrapeAssets(target);
+function assetNameSignature(assets) {
+  return (assets || []).map((asset) => asset.name).sort().join('|');
+}
+
+function shouldLogThrottled(target, field, now = Date.now()) {
+  if (now - target[field] < HEARTBEAT_INTERVAL) return false;
+  target[field] = now;
+  return true;
+}
+
+async function getAssetsForPoll(target) {
+  try {
+    const assets = await fetchAssetsFromChain(target);
+    target.lastPollMode = 'chain';
+    target.lastAssets = assets;
+
+    const validationDue = BROWSER_VALIDATION_INTERVAL > 0 &&
+      Date.now() - target.lastBrowserValidationAt >= BROWSER_VALIDATION_INTERVAL;
+    if (validationDue) {
+      target.lastBrowserValidationAt = Date.now();
+      const browserAssets = await runBrowserScrape(target, 'Periodic chain/browser validation', true);
+      if (browserAssets?.length && assetNameSignature(browserAssets) !== assetNameSignature(assets)) {
+        console.warn(`[VALIDATE:${target.label}] Chain and browser asset names differ`);
+      } else if (browserAssets?.length) {
+        console.log(`[VALIDATE:${target.label}] Chain and browser assets match`);
+      }
+      if (browserAssets?.length) target.lastPollMode = 'browser';
+    }
+    return assets;
+  } catch (err) {
+    if (shouldLogThrottled(target, 'lastChainErrorLogAt')) {
+      console.warn(`[CHAIN:${target.label}] Chain read failed: ${err.message}`);
+    }
+    const browserAssets = await runBrowserScrape(target, 'Chain read failed');
+    if (browserAssets?.length) return browserAssets;
+    throw err;
+  }
 }
 
 function logPollResult(target, assets) {
@@ -1018,8 +1148,8 @@ function logPollingStats(target, now = Date.now()) {
   console.log(
     `[STATS:${target.label}] Window ${(summary.windowMs / 1000).toFixed(1)}s | ` +
     `completed ${summary.completed} | avg interval ${summary.averageStartIntervalMs}ms | ` +
-    `avg duration ${summary.averageDurationMs}ms | RPC ${summary.rpcPolls} | ` +
-    `page ${summary.pagePolls} | failures ${summary.failures}`
+    `avg duration ${summary.averageDurationMs}ms | chain ${summary.chainPolls} | ` +
+    `browser ${summary.browserPolls} | failures ${summary.failures}`
   );
   resetPollingStatsWindow(stats, now);
 }
@@ -1083,8 +1213,14 @@ async function poll(target) {
       }
     }
   } catch (err) {
-    console.error(`[POLL:${target.label}] Unexpected error:`, err.message);
+    if (shouldLogThrottled(target, 'lastPollErrorLogAt')) {
+      console.error(`[POLL:${target.label}] Unexpected error:`, err.message);
+    }
     target.consecutiveErrors++;
+    if (target.consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
+      await notifyError(`连续 ${MAX_CONSECUTIVE_ERRORS} 次未能获取资产列表，请检查 RPC 和监控脚本`, target);
+      target.consecutiveErrors = 0;
+    }
   } finally {
     const finishedAt = Date.now();
     recordPollEnd(target.pollingStats, startedAt, target.lastPollMode, succeeded, finishedAt);
@@ -1117,6 +1253,7 @@ async function main() {
   console.log(`Targets: ${targets.length}`);
   for (const target of targets) console.log(`- ${target.label}: ${target.url}`);
   console.log(`Poll interval: ${POLL_INTERVAL}ms`);
+  console.log(`Monitoring mode: chain-first, browser fallback ${BROWSER_FALLBACK_ENABLED ? 'enabled' : 'disabled'}`);
   console.log(`Feishu webhook: ${FEISHU_WEBHOOK_URL ? 'configured' : '⚠️ NOT configured'}`);
 
   // Graceful shutdown
@@ -1131,9 +1268,6 @@ async function main() {
   // Load persisted state
   loadState();
 
-  // Init browser
-  await initBrowser();
-
   await Promise.all(targets.map(initializeTarget));
 
   targets.forEach((target, index) => {
@@ -1143,12 +1277,17 @@ async function main() {
 }
 
 async function initializeTarget(target) {
-  console.log(`[MAIN:${target.label}] Performing initial scrape...`);
+  console.log(`[MAIN:${target.label}] Performing initial chain read...`);
   let initialAssets = null;
   for (let attempt = 1; attempt <= 3; attempt++) {
-    initialAssets = await scrapeAssets(target);
+    try {
+      initialAssets = await getAssetsForPoll(target);
+    } catch (err) {
+      console.warn(`[MAIN:${target.label}] Initial read error: ${err.message}`);
+      initialAssets = null;
+    }
     if (initialAssets && initialAssets.length > 0) break;
-    console.warn(`[MAIN:${target.label}] Initial scrape attempt ${attempt}/3 returned no assets, retrying...`);
+    console.warn(`[MAIN:${target.label}] Initial read attempt ${attempt}/3 returned no assets, retrying...`);
     await new Promise((r) => setTimeout(r, PAGE_WAIT));
   }
 
@@ -1197,7 +1336,13 @@ module.exports = {
   hasValidAssetAddress,
   filterValidAssets,
   getPollingInitialDelay,
-  hasRpcResultChanged,
+  getUnderlyingSymbol,
+  decodeFactoryAssetsResult,
+  decodeSymbolResult,
+  validateChainAssets,
+  canUseBrowserFallback,
+  FACTORY_ABI,
+  ERC20_SYMBOL_ABI,
   createPollingStats,
   recordPollStart,
   recordPollEnd,
