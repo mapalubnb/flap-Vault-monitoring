@@ -17,6 +17,8 @@ const FLAP_URLS = (process.env.FLAP_URLS || process.env.FLAP_URL || DEFAULT_FLAP
 const POLL_INTERVAL = parseInt(process.env.POLL_INTERVAL, 10) || 1500;
 const PAGE_WAIT = parseInt(process.env.PAGE_WAIT, 10) || 8000;
 const SCRAPE_TIMEOUT = Math.max(PAGE_WAIT, 5000);
+const FULL_REFRESH_INTERVAL = parseInt(process.env.FULL_REFRESH_INTERVAL, 10) || 30 * 60 * 1000;
+const HEARTBEAT_INTERVAL = parseInt(process.env.HEARTBEAT_INTERVAL, 10) || 60 * 1000;
 const STATE_FILE = path.join(__dirname, 'known_assets.json');
 const MAX_CONSECUTIVE_ERRORS = 10;
 
@@ -36,6 +38,13 @@ function createTarget(url, index) {
     isPolling: false,
     consecutiveErrors: 0,
     lastDebugSnapshotAt: 0,
+    lastFullScrapeAt: 0,
+    lastHeartbeatAt: 0,
+    lastLoggedSignature: '',
+    lastAssets: [],
+    rpcProbes: [],
+    pendingRpcProbes: new Map(),
+    capturingRpcProbes: false,
     debugSnapshotFile: path.join(__dirname, `debug-flap-empty-${chain}-${factory.slice(2, 10)}.html`),
   };
 }
@@ -343,13 +352,37 @@ async function initTargetPage(target) {
       req.continue();
     }
   });
+  target.page.on('response', (response) => captureRpcProbe(target, response));
 }
 
-async function resetTargetPage(target) {
+async function captureRpcProbe(target, response) {
+  if (!target.capturingRpcProbes) return;
+  const request = response.request();
+  if (request.method() !== 'POST' || !['fetch', 'xhr'].includes(request.resourceType())) return;
+
+  try {
+    const payload = JSON.parse(request.postData() || '');
+    const factoryNeedle = target.factory.toLowerCase().replace(/^0x/, '');
+    if (payload.method !== 'eth_call' || !JSON.stringify(payload.params).toLowerCase().includes(factoryNeedle)) return;
+
+    const data = await response.json();
+    if (!data || data.error || data.result == null) return;
+    const key = `${request.url()}::${JSON.stringify(payload.params)}`;
+    target.pendingRpcProbes.set(key, {
+      key,
+      url: request.url(),
+      payload,
+      signature: JSON.stringify(data.result),
+    });
+  } catch (_) {
+    // Non-JSON and interrupted responses are not suitable as lightweight probes.
+  }
+}
+
+async function closeTargetPage(target) {
   await target.context?.close().catch(() => {});
   target.context = null;
   target.page = null;
-  await initTargetPage(target);
 }
 
 async function closeBrowser() {
@@ -597,15 +630,10 @@ async function extractAssetsFromPage(page) {
 }
 
 async function waitForStableAssets(page, timeoutMs = SCRAPE_TIMEOUT) {
-  // Try to wait until at least one supported-asset row is rendered. This selector
-  // matches the current v2 layout (`<span class="block truncate text-sm font-semibold ...">SYMBOLon</span>`
-  // or the bStocks variant `SYMBOLB`) but we silently fall back to polling if it
-  // never appears so we still survive future markup changes.
+  // Wait on the asset button itself. Reading the entire body text in a
+  // waitForFunction loop is expensive and never matched plain Robinhood tokens.
   try {
-    await page.waitForFunction(
-      () => /\b[A-Z0-9]{3,12}(?:on|B)\b/.test(document.body?.innerText || ''),
-      { timeout: Math.min(timeoutMs, 8000) }
-    );
+    await page.waitForSelector('button[aria-pressed]', { timeout: Math.min(timeoutMs, 8000) });
   } catch (_) {
     /* fall through to polling */
   }
@@ -743,6 +771,8 @@ async function scrapeAssets(target) {
   }
   const page = target.page;
   try {
+    target.pendingRpcProbes = new Map();
+    target.capturingRpcProbes = true;
     await page.goto(target.url, { waitUntil: 'domcontentloaded', timeout: 30000 });
     let assets = await waitForStableAssets(page);
 
@@ -776,6 +806,11 @@ async function scrapeAssets(target) {
     }
 
     assets = filterValidAssets(assets, target);
+    target.capturingRpcProbes = false;
+    if (target.pendingRpcProbes.size > 0) {
+      target.rpcProbes = [...target.pendingRpcProbes.values()];
+      console.log(`[SCRAPE:${target.label}] Captured ${target.rpcProbes.length} lightweight RPC probes`);
+    }
 
     if (!assets || assets.length === 0) {
       const diagnostics = await page.evaluate(() => {
@@ -809,18 +844,21 @@ async function scrapeAssets(target) {
         console.warn(`[SCRAPE:${target.label}] Target URL rendered a Create Token form WITHOUT a Supported Assets section. The configured URL may be stale or the vault factory was deprecated by the current flap.sh frontend.`);
       }
       await saveDebugSnapshot(target);
+    } else {
+      target.lastAssets = assets;
+      target.lastFullScrapeAt = Date.now();
     }
 
+    await closeTargetPage(target);
     return assets;
   } catch (err) {
+    target.capturingRpcProbes = false;
     console.error(`[SCRAPE:${target.label}] Error:`, err.message);
     // If page crashed, reinit browser
     if (/Target closed|Protocol error|Session closed|Execution context was destroyed|detached Frame|Cannot find context/i.test(err.message)) {
       console.log(`[SCRAPE:${target.label}] Page seems crashed, reinitializing...`);
-      await resetTargetPage(target).catch((resetErr) => {
-        console.error(`[SCRAPE:${target.label}] Page reinitialization failed:`, resetErr.message);
-      });
     }
+    await closeTargetPage(target);
     return null;
   }
 }
@@ -859,12 +897,67 @@ function rememberAsset(target, asset) {
   });
 }
 
+async function haveRpcProbesChanged(target) {
+  if (target.rpcProbes.length === 0) return true;
+
+  const results = await Promise.all(target.rpcProbes.map(async (probe) => {
+    const response = await axios.post(probe.url, probe.payload, {
+      timeout: 5000,
+      headers: { 'content-type': 'application/json' },
+    });
+    if (response.data?.error || response.data?.result == null) {
+      throw new Error(response.data?.error?.message || 'RPC returned no result');
+    }
+    return hasRpcResultChanged(probe, response.data);
+  }));
+
+  return results.some(Boolean);
+}
+
+function hasRpcResultChanged(probe, responseData) {
+  return JSON.stringify(responseData?.result) !== probe.signature;
+}
+
+function getPollingInitialDelay(index, count, interval = POLL_INTERVAL) {
+  return interval + Math.floor((interval * index) / Math.max(count, 1));
+}
+
+async function getAssetsForPoll(target) {
+  const fullRefreshDue = Date.now() - target.lastFullScrapeAt >= FULL_REFRESH_INTERVAL;
+  if (!target.lastAssets.length || !target.rpcProbes.length || fullRefreshDue) {
+    if (fullRefreshDue && target.lastFullScrapeAt > 0) {
+      console.log(`[POLL:${target.label}] Running periodic full-page verification`);
+    }
+    return scrapeAssets(target);
+  }
+
+  try {
+    const changed = await haveRpcProbesChanged(target);
+    if (!changed) return target.lastAssets;
+    console.log(`[POLL:${target.label}] On-chain asset configuration changed, refreshing page`);
+  } catch (err) {
+    console.warn(`[POLL:${target.label}] Lightweight RPC probe failed, falling back to page scrape: ${err.message}`);
+  }
+
+  return scrapeAssets(target);
+}
+
+function logPollResult(target, assets) {
+  const signature = assets.map((a) => `${a.name}:${a.address}`).join('|');
+  const now = Date.now();
+  if (signature === target.lastLoggedSignature && now - target.lastHeartbeatAt < HEARTBEAT_INTERVAL) return;
+
+  target.lastLoggedSignature = signature;
+  target.lastHeartbeatAt = now;
+  console.log(`[POLL:${target.label}] Found ${assets.length} assets: ${assets.map((a) => formatAssetSummary(a, target)).join('; ')}`);
+}
+
 async function poll(target) {
   if (target.isPolling) return;
   target.isPolling = true;
 
   try {
-    const assets = await scrapeAssets(target);
+    const assets = await getAssetsForPoll(target);
 
     if (!assets || assets.length === 0) {
       target.consecutiveErrors++;
@@ -877,7 +970,7 @@ async function poll(target) {
     }
 
     target.consecutiveErrors = 0;
-    console.log(`[POLL:${target.label}] Found ${assets.length} assets: ${assets.map((a) => formatAssetSummary(a, target)).join('; ')}`);
+    logPollResult(target, assets);
 
     // If baseline was not established during startup (initial scrape failed),
     // treat the first successful scrape as baseline — not as new assets.
@@ -920,13 +1013,13 @@ async function poll(target) {
   }
 }
 
-function startPolling(target) {
-  console.log(`[POLL:${target.label}] Starting with interval ${POLL_INTERVAL}ms`);
+function startPolling(target, initialDelay = POLL_INTERVAL) {
+  console.log(`[POLL:${target.label}] Starting with interval ${POLL_INTERVAL}ms, initial delay ${initialDelay}ms`);
   const loop = async () => {
     await poll(target);
     setTimeout(loop, POLL_INTERVAL);
   };
-  setTimeout(loop, POLL_INTERVAL);
+  setTimeout(loop, initialDelay);
 }
 
 // --- Global error handlers ---
@@ -962,7 +1055,9 @@ async function main() {
 
   await Promise.all(targets.map(initializeTarget));
 
-  for (const target of targets) startPolling(target);
+  targets.forEach((target, index) => {
+    startPolling(target, getPollingInitialDelay(index, targets.length));
+  });
   console.log('[MAIN] All monitors running. Press Ctrl+C to stop.');
 }
 
@@ -1020,6 +1115,8 @@ module.exports = {
   formatAssetSummary,
   hasValidAssetAddress,
   filterValidAssets,
+  getPollingInitialDelay,
+  hasRpcResultChanged,
   createTarget,
   targetAssetKey,
 };

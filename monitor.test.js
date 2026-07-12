@@ -4,8 +4,10 @@ const assert = require('node:assert/strict');
 const {
   createTarget,
   filterValidAssets,
+  getPollingInitialDelay,
   getIssuerInfo,
   hasValidAssetAddress,
+  hasRpcResultChanged,
   targetAssetKey,
 } = require('./monitor');
 
@@ -39,4 +41,13 @@ test('identifies issuers using both token suffixes and target chain', () => {
   assert.equal(getIssuerInfo('AAPLon').long, 'Ondo Finance');
   assert.equal(getIssuerInfo('NVDAB').long, 'Backed Finance');
   assert.equal(getIssuerInfo('AAPL', robinhood).long, 'Robinhood');
+});
+
+test('detects RPC changes without altering the configured polling interval', () => {
+  const probe = { signature: JSON.stringify('0x1234') };
+
+  assert.equal(hasRpcResultChanged(probe, { result: '0x1234' }), false);
+  assert.equal(hasRpcResultChanged(probe, { result: '0x5678' }), true);
+  assert.equal(getPollingInitialDelay(0, 2, 1200), 1200);
+  assert.equal(getPollingInitialDelay(1, 2, 1200), 1800);
 });
